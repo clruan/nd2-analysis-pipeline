@@ -414,7 +414,9 @@ class ND2Visualizer:
                 data=mouse_averages,
                 x='Group',
                 y=metric,
+                hue='Group',
                 palette='Set1',
+                legend=False,
                 ax=ax
             )
             

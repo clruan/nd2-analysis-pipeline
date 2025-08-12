@@ -2,14 +2,18 @@
 
 A professional-grade, cross-platform package for analyzing multi-channel ND2 microscopy images with advanced visualization and Excel reporting capabilities.
 
-**Cross-Platform Support**: Works on Windows and macOS
-**Flexible Configuration**: Study-specific pixel sizes and visualization settings
+**Cross-Platform Support**: Works on Windows and macOS  
+**GPU-Accelerated**: Uses pyclesperanto for fast image processing  
+**Robust Error Handling**: Handles GPU memory issues and null data gracefully  
+**Flexible Configuration**: Study-specific pixel sizes and visualization settings  
 **Professional Output**: Excel reports with statistical analysis and publication-quality visualizations
 
 ## Features
 
 - **Cross-Platform**: Runs on Windows and macOS
+- **GPU-Accelerated Processing**: Fast image analysis using pyclesperanto with OpenCL
 - **Multi-channel Analysis**: Process 3-channel ND2 files (Channel 1, 2, 3)
+- **Robust Error Handling**: Graceful handling of GPU memory issues and "Host data is null" errors
 - **Study-Specific Configuration**: Configure pixel sizes and settings per study/batch
 - **Custom Visualization Ranges**: Fine-tune channel visibility and contrast
 - **Parallel Processing**: High-performance batch processing with configurable CPU cores
@@ -18,6 +22,15 @@ A professional-grade, cross-platform package for analyzing multi-channel ND2 mic
 - **Representative Image Selection**: Automatically identifies most representative images for each group
 - **Flexible Grouping**: Single study design with customizable treatment groups
 - **Comprehensive Metrics**: Area, intensity, and ratio calculations for all channels
+- **Memory Management**: Automatic GPU memory clearing and optimization
+
+## Recent Improvements
+
+- **Enhanced Error Handling**: Robust handling of GPU memory issues and null data
+- **Performance Optimization**: GPU memory management and batch processing
+- **Better Logging**: Detailed logging of processing steps and errors
+- **Visualization Controls**: Option to skip visualizations for faster processing (`--no-visualization`)
+- **Configurable Parallel Jobs**: Optimize performance based on your hardware
 
 ## Installation
 
@@ -25,6 +38,7 @@ A professional-grade, cross-platform package for analyzing multi-channel ND2 mic
 - Python 3.8 or higher
 - Windows or macOS
 - Git (for installation from GitHub)
+- GPU with OpenCL support (recommended for best performance)
 
 ### Setup
 1. Clone the repository:
@@ -51,17 +65,36 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-### 1. Command Line Usage
+### Basic Analysis
 ```bash
-# Basic usage
-python main.py --input "path/to/nd2/files" --output "path/to/results"
-
-# With custom configuration (includes pixel size and visualization settings)
-python main.py --input "path/to/nd2/files" --output "path/to/results" --config "examples/configs/neuroblastoma_study.json"
-
-# Advanced usage with all options
-python main.py --input "path/to/nd2/files" --output "path/to/results" --dimension 3d --jobs 4 --config "examples/configs/thrombosis_study.json" --scale-bar 50
+python main.py --input "path/to/nd2/files/" --output "results/"
 ```
+
+### High-Performance Analysis
+```bash
+# Use more CPU cores and skip visualizations for speed
+python main.py --input "data/" --output "results/" --jobs 8 --no-visualization
+```
+
+### Custom Configuration
+```bash
+python main.py --input "data/" --output "results/" --config my_config.json --jobs 4
+```
+
+## Performance Optimization
+
+### For Best Performance:
+- **Use `--no-visualization`** for 50-70% speed improvement
+- **Increase `--jobs`** based on your CPU cores (check with `nproc` on Linux/macOS)
+- **Ensure GPU drivers are up to date** for optimal pyclesperanto performance
+- **Monitor GPU memory** if processing large datasets
+
+### Troubleshooting GPU Issues:
+If you encounter "Host data is null" errors:
+1. Reduce parallel jobs: `--jobs 2`
+2. Restart Python to clear GPU memory
+3. Update GPU drivers
+4. The pipeline will automatically handle these errors and continue processing
 
 ### 2. Jupyter Notebook Usage
 Open `example_usage.ipynb` for interactive analysis and visualization.

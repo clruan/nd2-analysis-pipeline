@@ -18,10 +18,10 @@ def read_requirements():
 
 setup(
     name="nd2-analysis-pipeline",
-    version="1.0.0",
+    version="1.1.0",
     author="ND2 Analysis Team",
     author_email="contact@nd2analysis.com",
-    description="Professional-grade, cross-platform package for analyzing multi-channel ND2 microscopy images",
+    description="Professional-grade, GPU-accelerated package for analyzing multi-channel ND2 microscopy images with robust error handling",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/clruan/nd2-analysis-pipeline",

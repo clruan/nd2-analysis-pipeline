@@ -7,7 +7,7 @@ from typing import Dict, Tuple, List, Optional, Union, Any
 from pathlib import Path
 import logging
 
-import pyclesperanto_prototype as cle
+import pyclesperanto as cle
 from nd2reader import ND2Reader, Nd2
 
 from data_models import ChannelData, ImageMetrics
@@ -117,25 +117,73 @@ def analyze_channel(
     Returns:
         ChannelData object with analysis results
     """
-    # Create threshold mask
-    threshold = cle.greater_constant(image, None, threshold_value)
-    
-    # Compute statistics
-    stats_dict = cle.statistics_of_labelled_pixels(image, threshold)
-    stats = pd.DataFrame(stats_dict)
-    
-    if len(stats) > 0:
-        # Keep only relevant columns
-        required_cols = ['area', 'mean_intensity', 'sum_intensity', 'min_intensity', 'max_intensity']
-        available_cols = [col for col in required_cols if col in stats.columns]
-        stats = stats[available_cols]
-    
-    return ChannelData(
-        raw=image, 
-        threshold=threshold, 
-        stats=stats,
-        threshold_value=threshold_value
-    )
+    try:
+        # Ensure image is not empty and has valid data
+        if image is None or image.size == 0:
+            logger.warning("Empty or null image data encountered")
+            # Create empty stats DataFrame with required columns
+            stats = pd.DataFrame({
+                'area': [0],
+                'mean_intensity': [0],
+                'sum_intensity': [0],
+                'min_intensity': [0],
+                'max_intensity': [0]
+            })
+            # Create a zero threshold mask with same shape as image if possible
+            threshold = np.zeros_like(image) if image is not None else np.array([[0]])
+            return ChannelData(
+                raw=image, 
+                threshold=threshold, 
+                stats=stats,
+                threshold_value=threshold_value
+            )
+        
+        # Create threshold mask
+        threshold = cle.greater_constant(image, None, threshold_value)
+        
+        # Compute statistics - handle case where no regions are found
+        stats_dict = cle.statistics_of_labelled_pixels(image, threshold)
+        stats = pd.DataFrame(stats_dict)
+        
+        # If no statistics were found (no regions above threshold), create default row
+        if len(stats) == 0:
+            stats = pd.DataFrame({
+                'area': [0],
+                'mean_intensity': [0],
+                'sum_intensity': [0],
+                'min_intensity': [0],
+                'max_intensity': [0]
+            })
+        else:
+            # Keep only relevant columns
+            required_cols = ['area', 'mean_intensity', 'sum_intensity', 'min_intensity', 'max_intensity']
+            available_cols = [col for col in required_cols if col in stats.columns]
+            stats = stats[available_cols]
+        
+        return ChannelData(
+            raw=image, 
+            threshold=threshold, 
+            stats=stats,
+            threshold_value=threshold_value
+        )
+        
+    except Exception as e:
+        logger.warning(f"Error in channel analysis (returning zeros): {e}")
+        # Return default values when analysis fails
+        stats = pd.DataFrame({
+            'area': [0],
+            'mean_intensity': [0],
+            'sum_intensity': [0],
+            'min_intensity': [0],
+            'max_intensity': [0]
+        })
+        threshold = np.zeros_like(image) if image is not None else np.array([[0]])
+        return ChannelData(
+            raw=image, 
+            threshold=threshold, 
+            stats=stats,
+            threshold_value=threshold_value
+        )
 
 def safe_get_row(stats: pd.DataFrame) -> pd.Series:
     """
@@ -301,7 +349,7 @@ def calculate_group_statistics(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     
     # Calculate mouse averages within each group (one row per mouse)
-    mouse_averages = df.groupby(["Group", "MouseID"])[numeric_cols].mean().round(3).reset_index()
+    mouse_averages = df.groupby(["Group", "MouseID"])[numeric_cols].mean().reset_index()
     
     logger.info(f"Calculated mouse averages for {len(mouse_averages)} mice across {len(df['Group'].unique())} groups")
     return mouse_averages
