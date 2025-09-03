@@ -1,297 +1,191 @@
-# ND2 Image Analysis Pipeline
+# 🔬 ND2 Image Analysis Pipeline
 
-A professional-grade, cross-platform package for analyzing multi-channel ND2 microscopy images with advanced visualization and Excel reporting capabilities.
+> **A comprehensive Python package for analyzing ND2 microscopy files with interactive web-based threshold analysis, advanced visualization, and statistical analysis capabilities.**
 
-**Cross-Platform Support**: Works on Windows and macOS  
-**GPU-Accelerated**: Uses pyclesperanto for fast image processing  
-**Robust Error Handling**: Handles GPU memory issues and null data gracefully  
-**Flexible Configuration**: Study-specific pixel sizes and visualization settings  
-**Professional Output**: Excel reports with statistical analysis and publication-quality visualizations
+## ✨ Interactive Threshold Analysis (New!)
 
-## Features
+🎯 **Transform your static analysis into real-time, interactive exploration!**
 
-- **Cross-Platform**: Runs on Windows and macOS
-- **GPU-Accelerated Processing**: Fast image analysis using pyclesperanto with OpenCL
-- **Multi-channel Analysis**: Process 3-channel ND2 files (Channel 1, 2, 3)
-- **Robust Error Handling**: Graceful handling of GPU memory issues and "Host data is null" errors
-- **Study-Specific Configuration**: Configure pixel sizes and settings per study/batch
-- **Custom Visualization Ranges**: Fine-tune channel visibility and contrast
-- **Parallel Processing**: High-performance batch processing with configurable CPU cores
-- **Excel Reports**: Professional Excel output with formatting and representative image highlighting
-- **Advanced Visualization**: Interactive image viewers with customizable scale bars
-- **Representative Image Selection**: Automatically identifies most representative images for each group
-- **Flexible Grouping**: Single study design with customizable treatment groups
-- **Comprehensive Metrics**: Area, intensity, and ratio calculations for all channels
-- **Memory Management**: Automatic GPU memory clearing and optimization
+- **🎛️ Real-time threshold sliders** for all 3 channels (0-4095 range)
+- **📊 Interactive boxplots** showing all treatment groups simultaneously  
+- **📈 Statistical analysis** with parametric/non-parametric tests
+- **🐭 Individual mouse visualization** with replicate data on hover
+- **🌈 5 analysis channels**: RGB + Green/Blue + Red/Blue ratios
+- **🎨 Customizable color palettes** for professional presentations
 
-## Recent Improvements
+## 🚀 Quick Start
 
-- **Enhanced Error Handling**: Robust handling of GPU memory issues and null data
-- **Performance Optimization**: GPU memory management and batch processing
-- **Better Logging**: Detailed logging of processing steps and errors
-- **Visualization Controls**: Option to skip visualizations for faster processing (`--no-visualization`)
-- **Configurable Parallel Jobs**: Optimize performance based on your hardware
+### Interactive Analysis (Recommended)
 
-## Installation
-
-### Prerequisites
-- Python 3.8 or higher
-- Windows or macOS
-- Git (for installation from GitHub)
-- GPU with OpenCL support (recommended for best performance)
-
-### Setup
-1. Clone the repository:
 ```bash
-git clone https://github.com/clruan/nd2-analysis-pipeline.git
+# 1. Setup environment
+git clone <repository-url>
 cd nd2-analysis-pipeline
-```
-
-2. Create a virtual environment:
-```bash
-# Windows
-python -m venv venv
-venv\Scripts\activate
-
-# macOS/Linux  
-python3 -m venv venv
-source venv/bin/activate
-```
-
-3. Install dependencies:
-```bash
+python -m venv venv_threshold
+venv_threshold\Scripts\activate
 pip install -r requirements.txt
+pip install -r threshold_analysis/requirements.txt
+
+# 2. Process your data
+python test_threshold_analysis.py --batch "your_study_directory" "examples/configs/your_config.json" "VWF(R)"
+
+# 3. Start interactive system
+# Terminal 1: API Server
+python -m threshold_analysis.web_api.main
+
+# Terminal 2: Web Interface
+cd threshold_analysis/web_interface && npm install && npm start
+
+# 4. Open browser: http://localhost:3000
 ```
 
-## Quick Start
+**Result**: Drag threshold sliders → See instant updates across all treatment groups in real-time boxplots!
 
-### Basic Analysis
+### Traditional Analysis (Original)
+
 ```bash
+# Standard pipeline with fixed thresholds
+python -m venv venv
+venv\Scripts\activate  # Windows
+pip install -r requirements.txt
+
+# Process files
 python main.py --input "path/to/nd2/files/" --output "results/"
 ```
 
-### High-Performance Analysis
-```bash
-# Use more CPU cores and skip visualizations for speed
-python main.py --input "data/" --output "results/" --jobs 8 --no-visualization
-```
+## 📚 Complete Documentation
 
-### Custom Configuration
-```bash
-python main.py --input "data/" --output "results/" --config my_config.json --jobs 4
-```
+### **📖 [USER_GUIDE.md](USER_GUIDE.md) - Comprehensive Usage Guide**
+> **Everything you need: installation, data processing, web interface, statistical analysis, and troubleshooting**
 
-## Performance Optimization
+**Quick Links**:
+- [Installation & Setup](USER_GUIDE.md#️-installation--setup)
+- [Data Processing Guide](USER_GUIDE.md#-data-processing)  
+- [Web Interface Usage](USER_GUIDE.md#-web-interface)
+- [Statistical Analysis](USER_GUIDE.md#-statistical-analysis)
+- [Troubleshooting](USER_GUIDE.md#️-troubleshooting)
 
-### For Best Performance:
-- **Use `--no-visualization`** for 50-70% speed improvement
-- **Increase `--jobs`** based on your CPU cores (check with `nproc` on Linux/macOS)
-- **Ensure GPU drivers are up to date** for optimal pyclesperanto performance
-- **Monitor GPU memory** if processing large datasets
+### Additional Resources
+- [Installation Guide](INSTALL.md) - Detailed setup instructions
+- [Configuration Examples](examples/README.md) - Sample study configurations
+- [Changelog](CHANGELOG.md) - Version history and updates
+- [Upgrade Guide](UPGRADE_GUIDE.md) - Migration between versions
 
-### Troubleshooting GPU Issues:
-If you encounter "Host data is null" errors:
-1. Reduce parallel jobs: `--jobs 2`
-2. Restart Python to clear GPU memory
-3. Update GPU drivers
-4. The pipeline will automatically handle these errors and continue processing
+## 🎯 Two Analysis Modes
 
-### 2. Jupyter Notebook Usage
-Open `example_usage.ipynb` for interactive analysis and visualization.
+### 🌐 Interactive Mode (New!)
+- **Web-based interface** with real-time threshold adjustment
+- **Pre-compute all thresholds** (0-4095) for instant response
+- **Statistical comparison tools** with visual significance markers
+- **Professional visualization** suitable for presentations
+- **Multi-channel analysis** with ratio calculations
 
-### 3. Configuration File
-Create a JSON configuration file for your specific study. See `examples/configs/` for templates:
+### 📊 Traditional Mode (Original)
+- **Command-line processing** with fixed thresholds
+- **Batch analysis** for large datasets
+- **Excel output** with detailed statistics
+- **Established workflow** for routine analysis
 
-```json
-{
-  "study_name": "neuroblastoma_batch1",
-  "pixel_size_um": 0.65,
-  "description": "Neuroblastoma study with custom settings",
-  "groups": {
-    "Control": ["C01", "C02", "C03", "C04"],
-    "Treatment_Low": ["T01", "T02", "T03", "T04"],
-    "Treatment_High": ["T05", "T06", "T07", "T08"]
-  },
-  "thresholds": {
-    "2d": {
-      "channel_1": 800.0,
-      "channel_2": 600.0,
-      "channel_3": 200.0
-    },
-    "3d": {
-      "channel_1": 2000.0,
-      "channel_2": 1800.0,
-      "channel_3": 250.0
-    }
-  },
-  "VISUALIZATION_RANGES": {
-    "channel_1": {"vmin": 50, "vmax": 3000},
-    "channel_2": {"vmin": 80, "vmax": 2500},
-    "channel_3": {"vmin": 20, "vmax": 800}
-  }
-}
-```
+## 🔧 Core Features
 
-## Output Files
+### Image Processing
+- **ND2 file support** with automatic metadata extraction
+- **Multi-channel analysis** (Green, Red, Blue channels)
+- **Flexible thresholding** with customizable parameters
+- **Batch processing** with progress tracking
+- **GPU acceleration** using pyclesperanto
 
-The pipeline generates several types of output:
-
-### Excel Reports
-- **`analysis_results.xlsx`**: Main results file with multiple sheets
-  - `Raw_Data`: All individual image measurements
-  - `Group_Summary`: Aggregated statistics by treatment group
-  - `Representative_Images`: Highlighted most representative images
-  - `Statistical_Analysis`: Group comparisons and statistics
+### Statistical Analysis
+- **Parametric/non-parametric tests** (t-test, ANOVA, Mann-Whitney U, Kruskal-Wallis)
+- **Multiple comparison corrections** with significance markers
+- **Group-based comparisons** with visual annotations
+- **Real-time statistics** that update with threshold changes
 
 ### Visualization
-- **`representative_images/`**: Most representative image from each group
-- **`all_visualizations/`**: Complete visualization gallery organized by group and mouse
-- **`individual_files/`**: Single file visualizations (on demand)
+- **Interactive boxplots** with mouse-level data points
+- **Individual replicate visualization** on hover
+- **Color palette customization** (5 professional schemes)
+- **Statistical comparison bars** with significance indicators
+- **High-resolution output** for publications
 
-### Data Files
-- **`processed_data.json`**: Machine-readable results for further analysis
+### Data Export
+- **JSON format** for web applications and sharing
+- **Excel output** with multiple sheets (traditional mode)
+- **Real-time analysis** without file generation needed
 
-## Command Line Arguments
+## 🔍 System Requirements
 
-| Argument | Short | Description | Default |
-|----------|-------|-------------|---------|
-| `--input` | `-i` | Directory containing ND2 files | Required |
-| `--output` | `-o` | Output directory for results | `{input}/results` |
-| `--config` | `-c` | Path to JSON configuration file | Built-in config |
-| `--dimension` | `-d` | Data dimension (2d/3d) | `3d` |
-| `--jobs` | `-j` | Number of parallel jobs | `4` |
-| `--scale-bar` | `-s` | Scale bar size in micrometers | `50` |
-| `--marker` | `-m` | Filename marker for mouse ID extraction | `C1` |
-| `--verbose` | `-v` | Enable verbose logging | `False` |
+### Interactive Analysis
+- **Python 3.8+** with pip
+- **Node.js 14+** with npm  
+- **8GB RAM minimum** (16GB recommended for large studies)
+- **Modern web browser** (Chrome, Firefox, Edge, Safari)
 
-## Visualization Options
+### Traditional Analysis
+- **Python 3.8+** with pip
+- **4GB RAM minimum** for basic processing
+- **GPU with OpenCL support** (recommended for performance)
 
-### 1. Representative Images (Automatic)
-```powershell
-# Automatically generated - most representative image per group
-python main.py --input "data/" --output "results/"
-```
-
-### 2. Specific File Visualization
-```powershell
-# Visualize a specific file
-python visualize.py --file "path\to\specific\file.nd2" --output "results\specific\"
-```
-
-### 3. Group Gallery
-```powershell
-# Create complete visualization gallery
-python visualize.py --input "data/" --output "results\gallery\" --mode gallery --scale-bar 100
-```
-
-## Project Structure
+## 🏗️ Project Structure
 
 ```
-ND2_Analysis_Pipeline/
-├── README.md                 # This file
-├── requirements.txt          # Python dependencies
-├── setup.py                  # Package installation
-├── config.py                # Default configuration parameters
-├── data_models.py           # Data structures and models
-├── image_processing.py      # Core image analysis functions
-├── excel_output.py          # Excel report generation
-├── visualization.py         # Image visualization tools
-├── processing_pipeline.py   # Main processing workflows
-├── main.py                  # Command line interface
-├── visualize.py            # Standalone visualization tool
-├── example_usage.ipynb     # Example Jupyter notebook
-├── examples/               # Example configurations and documentation
-│   ├── README.md          # Configuration guide
-│   └── configs/           # JSON configuration files
-│       ├── neuroblastoma_study.json
-│       ├── thrombosis_study.json
-│       └── high_resolution_study.json
-└── tests/                  # Unit tests
-    ├── __init__.py
-    ├── test_image_processing.py
-    └── test_pipeline.py
+nd2-analysis-pipeline/
+├── USER_GUIDE.md                   # Comprehensive usage guide
+├── README.md                       # This file
+├── requirements.txt                # Main project dependencies
+├── test_threshold_analysis.py      # CLI tool for data processing
+│
+├── threshold_analysis/             # Interactive analysis module
+│   ├── requirements.txt            # Additional dependencies
+│   ├── data_models.py              # Data structures
+│   ├── generator.py                # Core processing functions
+│   ├── batch_processor.py          # Batch processing with progress
+│   ├── web_api/                    # Backend API server
+│   │   └── main.py                 # FastAPI application
+│   └── web_interface/              # Frontend React application
+│       ├── package.json            # Node.js dependencies
+│       └── src/                    # React components
+│
+├── main.py                         # Traditional CLI interface
+├── processing_pipeline.py          # Original batch processing
+├── image_processing.py             # Core image analysis functions
+├── visualization.py                # Traditional visualization tools
+├── excel_output.py                 # Excel report generation
+│
+└── examples/                       # Example configurations (kept local)
+    └── configs/                    # Sample study configurations
 ```
 
-## Advanced Usage
+## 🤝 Getting Help
 
-### Custom Thresholds
-Modify thresholds in your config file or programmatically:
-
-```python
-from processing_pipeline import ND2Pipeline
-
-pipeline = ND2Pipeline()
-pipeline.config.thresholds['3d']['channel_1'] = 3000.0
-results = pipeline.process_directory('data/')
-```
-
-### Visualization Customization
-```python
-from visualization import ND2Visualizer
-
-visualizer = ND2Visualizer(scale_bar_um=100)
-visualizer.create_representative_gallery('results/', 'gallery/')
-visualizer.visualize_single_file('file.nd2', 'output.png')
-```
-
-### Excel Report Customization
-```python
-from excel_output import ExcelReporter
-
-reporter = ExcelReporter()
-reporter.create_report(results_df, 'custom_report.xlsx', 
-                      highlight_top_n=3, include_charts=True)
-```
-
-## Troubleshooting
+### Quick Solutions
+1. **📖 Read [USER_GUIDE.md](USER_GUIDE.md)** - Comprehensive troubleshooting section
+2. **🐛 Check GitHub Issues** - Search existing problems and solutions
+3. **💬 Start a Discussion** - Ask questions and share experiences
 
 ### Common Issues
+- **Marker extraction problems** → See filename pattern guide in USER_GUIDE.md
+- **Web interface not loading** → Check server startup and browser console
+- **Performance issues** → Review hardware requirements and optimization tips
 
-1. **ND2 files not found**
-   - Check file paths (use forward slashes or escaped backslashes)
-   - Ensure files have `.nd2` extension
+## 📄 License
 
-2. **Memory issues with large files**
-   - Reduce number of parallel jobs: `--jobs 2`
-   - Process files in smaller batches
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-3. **Mouse ID extraction errors**
-   - Check filename format and marker position
-   - Use custom marker: `--marker "20X"`
+## 🙏 Acknowledgments
 
-### Performance Optimization
+### Core Technologies
+- **Scientific Computing**: numpy, scipy, pandas
+- **Web Framework**: FastAPI (backend), React (frontend)
+- **Visualization**: Plotly.js for interactive plots
+- **Image Processing**: pyclesperanto for GPU acceleration
+- **File Handling**: nd2reader for ND2 file support
 
-- **SSD storage**: Process files from SSD for better performance
-- **RAM**: 16GB+ recommended for large datasets
-- **CPU cores**: Use `--jobs` equal to your CPU core count
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Citation
-
-If you use this pipeline in your research, please cite:
-
-```
-ND2 Image Analysis Pipeline (2025)
-GitHub repository: https://github.com/clruan/nd2-analysis-pipeline
-```
-
-## Support
-
-For issues and questions:
-- Create an issue on GitHub
-- Check the troubleshooting section
-- Review example usage in the Jupyter notebook
+### Special Features
+- **Real-time Analysis**: Pre-computation strategy for instant threshold updates
+- **Statistical Integration**: Seamless parametric/non-parametric test selection
+- **Professional UI**: Publication-ready visualizations with customizable styling
 
 ---
 
-*Last updated: June 16, 2025*
+**🚀 Ready to make your ND2 analysis interactive? Start with [USER_GUIDE.md](USER_GUIDE.md)!**

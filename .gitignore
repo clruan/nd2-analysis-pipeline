@@ -78,6 +78,24 @@ results/
 data/
 *.nd2
 
+# Example configs and generated results (keep local)
+examples/configs/
+threshold_results_*.json
+intermediate_results_*.json
+
+# Node.js dependencies and build files
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn-integrity
+build/
+dist/
+
+# Virtual environment directories
+venv_threshold/
+
 # Log files
 *.log
 
