@@ -1,0 +1,22 @@
+{
+  "groups": {
+    "Control_Saline": ["M01", "M02", "M03", "M04"],
+    "Treatment_Group1": ["M05", "M06", "M07", "M08"],
+    "Treatment_Group2": ["M09", "M10", "M11", "M12"],
+    "Treatment_Group3": ["M13", "M14", "M15", "M16"],
+    "Treatment_Group4": ["M17", "M18", "M19", "M20"]
+  },
+  "thresholds": {
+    "3d": {
+      "channel_1": 1000.0,
+      "channel_2": 1200.0,
+      "channel_3": 300.0
+    }
+  },
+  "pixel_size_um": 0.222,
+  "VISUALIZATION_RANGES": {
+    "channel_1": {"vmin": 50, "vmax": 2000},
+    "channel_2": {"vmin": 80, "vmax": 1500},
+    "channel_3": {"vmin": 20, "vmax": 1100}
+  }
+}

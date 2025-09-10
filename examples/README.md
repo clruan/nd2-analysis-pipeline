@@ -45,10 +45,9 @@ python main.py -i "data/" -o "results/" -c "examples/configs/neuroblastoma_study
 
 ## Available Examples
 
-- **`neuroblastoma_study.json`** - High resolution neuroblastoma study (0.65 µm/pixel)
-- **`thrombosis_study.json`** - Standard thrombosis study (0.222 µm/pixel) 
-- **`high_resolution_study.json`** - Ultra-high resolution imaging (0.1 µm/pixel)
-- **`Pat_thrombosis_study1_set3.json`** - Your original thrombosis study configuration
+- **`example_study.json`** - Standard 3-group study template (0.222 µm/pixel)
+- **`kidney_study.json`** - Multi-group kidney study with 5 treatment groups (0.222 µm/pixel)
+- **`lung_study.json`** - Lung study with negative control and 5 experimental groups (0.444 µm/pixel)
 
 ## Customizing for Your Study
 

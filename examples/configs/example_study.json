@@ -1,0 +1,20 @@
+{
+  "groups": {
+    "Control": ["A1", "A2", "A3", "A4"],
+    "Treatment_Low": ["B1", "B2", "B3", "B4"],
+    "Treatment_High": ["C1", "C2", "C3", "C4"]
+  },
+  "thresholds": {
+    "3d": {
+      "channel_1": 2500.0,
+      "channel_2": 2500.0,
+      "channel_3": 300.0
+    }
+  },
+  "pixel_size_um": 0.222,
+  "VISUALIZATION_RANGES": {
+    "channel_1": {"vmin": 50, "vmax": 3000},
+    "channel_2": {"vmin": 80, "vmax": 2500},
+    "channel_3": {"vmin": 20, "vmax": 800}
+  }
+}

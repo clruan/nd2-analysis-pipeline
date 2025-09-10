@@ -1,0 +1,23 @@
+{
+  "groups": {
+    "Negative_Control": ["N01"],
+    "Group_A": ["A01", "A02", "A03", "A04"],
+    "Group_B": ["B01", "B02", "B03", "B04"],
+    "Group_C": ["C01", "C02", "C03", "C04"],
+    "Group_D": ["D01", "D02", "D03", "D04"],
+    "Group_E": ["E01", "E02", "E03", "E04"]
+  },
+  "thresholds": {
+    "3d": {
+      "channel_1": 2500.0,
+      "channel_2": 2500.0,
+      "channel_3": 300.0
+    }
+  },
+  "pixel_size_um": 0.444,
+  "VISUALIZATION_RANGES": {
+    "channel_1": {"vmin": 50, "vmax": 3000},
+    "channel_2": {"vmin": 80, "vmax": 2500},
+    "channel_3": {"vmin": 20, "vmax": 800}
+  }
+}

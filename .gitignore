@@ -78,10 +78,17 @@ results/
 data/
 *.nd2
 
-# Example configs and generated results (keep local)
-examples/configs/
+# Private data and study-specific results (keep local)
+examples/configs/ATIII_study1_kidney.json
+examples/configs/C1inh_lung_study2.json
+examples/configs/JB_skin.json
 threshold_results_*.json
 intermediate_results_*.json
+
+# Private file names with identifiable information
+*Study_2_Octapharrma*
+*Julia_Nguyen*
+*nas.uic.umn.edu*
 
 # Node.js dependencies and build files
 node_modules/

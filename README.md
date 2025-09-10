@@ -27,7 +27,7 @@ pip install -r requirements.txt
 pip install -r threshold_analysis/requirements.txt
 
 # 2. Process your data
-python test_threshold_analysis.py --batch "your_study_directory" "examples/configs/your_config.json" "VWF(R)"
+python test_threshold_analysis.py --batch "your_study_directory" "examples/configs/example_study.json" "MARKER"
 
 # 3. Start interactive system
 # Terminal 1: API Server

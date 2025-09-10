@@ -482,6 +482,83 @@ Real-time Interface → Statistical Analysis → Visualization
 4. **Analyze results**: Use boxplots to identify significant differences
 5. **Export findings**: Screenshot plots for presentations/publications
 
+---
+
+## ⚡ Batch Processing & Advanced Setup
+
+### 🚀 Robust Batch Processing
+
+For processing large datasets with progress tracking and error recovery:
+
+```bash
+# Process entire study directory
+python test_threshold_analysis.py --batch "path/to/study/directory" "examples/configs/example_study.json" "MARKER"
+
+# Monitor progress in separate terminal
+# The system automatically saves intermediate results every 5 files
+```
+
+#### What You'll See:
+```
+🔍 Searching for ND2 files...
+📊 Found 45 ND2 files
+
+📁 Processing file 1/45
+   File: Study_Set_1_Sample_A1_Channel.nd2
+   Progress: 2.2%
+   ✅ Success: A1 (Control) - 45.3s
+   ⏱️  Estimated time remaining: 33.2 minutes
+
+📁 Processing file 5/45
+   💾 Saved intermediate results: intermediate_results_5_files.json
+```
+
+#### Recovery Options:
+- **Intermediate saves**: Every 5 files processed
+- **Progress tracking**: Real-time timing and estimation
+- **Error handling**: Individual file failures don't stop the batch
+- **Network resilience**: Pre-flight connectivity testing
+
+#### Performance Tips:
+```bash
+# For faster processing, copy files locally first
+robocopy "\\network\path" "C:\temp\local_files" *.nd2 /S
+python test_threshold_analysis.py --batch "C:\temp\local_files" "config.json" "MARKER"
+```
+
+### 🐍 Virtual Environment Setup
+
+#### Quick Setup:
+```bash
+# Create and activate environment
+python -m venv venv_threshold
+venv_threshold\Scripts\activate  # Windows
+source venv_threshold/bin/activate  # macOS/Linux
+
+# Install dependencies
+pip install -r requirements.txt
+pip install -r threshold_analysis/requirements.txt
+```
+
+#### Testing Your Setup:
+```bash
+# Test single file processing
+python test_threshold_analysis.py "path/to/test.nd2" "examples/configs/example_study.json" "MARKER"
+
+# Should output:
+# ✅ SUCCESS: Threshold analysis completed!
+# Mouse: A1, Group: Control
+# Channel 1 at threshold 1000: 15.23%
+```
+
+#### Troubleshooting:
+- **Module import errors**: Ensure you're in the correct directory with virtual environment active
+- **ND2 file access**: Test file accessibility before batch processing
+- **Memory issues**: Process files sequentially (n_jobs=1) for large files
+- **Network timeouts**: Copy files locally or use robust network connection
+
+---
+
 ## 📚 Additional Resources
 
 ### Learning and Development
