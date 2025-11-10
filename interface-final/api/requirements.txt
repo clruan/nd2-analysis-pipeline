@@ -1,0 +1,14 @@
+#
+# Runtime dependencies for the Interface-Final FastAPI service.
+# This file intentionally vendors the shared scientific stack from the
+# root `requirements.txt` to keep the backend self-contained when the
+# interface is deployed independently.
+#
+
+-r ../../requirements.txt
+
+fastapi>=0.111.0,<0.116.0
+uvicorn[standard]>=0.26.0,<0.31.0
+pydantic>=2.9.2,<3.0.0
+python-multipart>=0.0.6,<0.0.10
+Pillow>=10.0.0,<11.0.0
