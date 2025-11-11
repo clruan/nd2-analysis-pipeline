@@ -33,6 +33,10 @@ from .schemas import (
     RunStatus,
     StatisticsRequest,
     StatisticsResponse,
+    StudyBuilderRequest,
+    StudyBuilderResponse,
+    InterpretationRequest,
+    InterpretationResponse,
     ThresholdRunRequest,
     UploadResponse,
 )
@@ -51,6 +55,7 @@ from .services.studies import (
 )
 from .services.uploads import UploadCategory, store_upload
 from .services.threshold_runner import describe_run, launch_threshold_run
+from .services.assistants import generate_study_guidance, summarize_metric
 from .state import STATE
 
 
@@ -164,6 +169,14 @@ def create_app() -> FastAPI:
             original_name=file.filename or "",
             category=category,
         )
+
+    @app.post("/assistant/study-builder", response_model=StudyBuilderResponse)
+    async def study_builder_endpoint(request: StudyBuilderRequest) -> StudyBuilderResponse:
+        return generate_study_guidance(request)
+
+    @app.post("/assistant/interpretation", response_model=InterpretationResponse)
+    async def interpretation_endpoint(request: InterpretationRequest) -> InterpretationResponse:
+        return summarize_metric(request)
 
     return app
 

@@ -13,7 +13,11 @@ import type {
   StatisticsResponse,
   UploadResponse,
   RatioUpdateResponse,
-  RatioDefinition
+  RatioDefinition,
+  StudyBuilderRequest,
+  StudyBuilderResponse,
+  InterpretationRequest,
+  InterpretationResponse
 } from "./types";
 
 export function useConfigScan() {
@@ -198,6 +202,18 @@ export function useFileUpload() {
       });
       return response.data;
     }
+  });
+}
+
+export function useStudyBuilderAssistant() {
+  return useMutation({
+    mutationFn: (payload: StudyBuilderRequest) => api.post<StudyBuilderResponse>("/assistant/study-builder", payload)
+  });
+}
+
+export function useInterpretationAssistant() {
+  return useMutation({
+    mutationFn: (payload: InterpretationRequest) => api.post<InterpretationResponse>("/assistant/interpretation", payload)
   });
 }
 

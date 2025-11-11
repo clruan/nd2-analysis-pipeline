@@ -3,7 +3,7 @@ import PlotlyChart from "./PlotlyChart";
 import type { PlotHoverEvent, Shape, Annotations, PlotlyHTMLElement, DownloadImgopts } from "plotly.js";
 import { Alert, Box, Button, CircularProgress, Stack, Typography } from "@mui/material";
 import { apiClient } from "../api/client";
-import { useAnalysisQuery, useDownloadMutation, useStatisticsQuery } from "../api/hooks";
+import { useAnalysisQuery, useDownloadMutation, useStatisticsQuery, useInterpretationAssistant } from "../api/hooks";
 import { useAppStore } from "../state/useAppStore";
 import { useThresholds } from "../hooks/useThresholds";
 import type { IndividualImageRecord, MouseAverageRecord } from "../api/types";
@@ -54,6 +54,11 @@ interface HoverState {
   groupIndex: number;
 }
 
+interface MetricInsight {
+  summary: string;
+  bullets: string[];
+}
+
 type PlotlyModule = typeof import("plotly.js");
 
 const apiBase = (apiClient.defaults.baseURL ?? "").replace(/\/$/, "");
@@ -100,6 +105,16 @@ const baseLayout = {
     tickfont: { color: "#0f172a" }
   }
 } as const;
+
+const describeAssistantError = (error: unknown) => {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  return "Assistant unavailable. Try again soon.";
+};
 
 const testTypeLabel: Record<string, string> = {
   anova_parametric: "Ordinary ANOVA",
@@ -322,6 +337,9 @@ export default function AnalysisBoard() {
   const [hoverState, setHoverState] = useState<HoverState | null>(null);
   const plotRefs = useRef<Record<string, PlotlyHTMLElement | null>>({});
   const [exportingPlot, setExportingPlot] = useState<string | null>(null);
+  const [metricInsights, setMetricInsights] = useState<Record<string, MetricInsight>>({});
+  const [pendingInsight, setPendingInsight] = useState<string | null>(null);
+  const interpretationMutation = useInterpretationAssistant();
 
   if (!study) {
     return (
@@ -419,6 +437,61 @@ export default function AnalysisBoard() {
     } finally {
       setExportingPlot((current) => (current === metricId ? null : current));
     }
+  };
+
+  const handleGenerateInsight = (
+    metricId: string,
+    metricLabel: string,
+    groupedData: Array<{ group: string; mean: number; sd: number; count: number }>,
+    statBlock?: StatisticalBlock
+  ) => {
+    const groupSummaries = groupedData.map((entry) => ({
+      group: entry.group,
+      mean: entry.mean,
+      sd: Number.isFinite(entry.sd) ? entry.sd : null,
+      count: entry.count
+    }));
+    if (!groupSummaries.length) {
+      setMetricInsights((prev) => ({
+        ...prev,
+        [metricId]: {
+          summary: "Need at least one subject per group to generate an interpretation.",
+          bullets: []
+        }
+      }));
+      return;
+    }
+    setPendingInsight(metricId);
+    interpretationMutation.mutate(
+      {
+        metric_id: metricId,
+        metric_label: metricLabel,
+        group_summaries: groupSummaries,
+        reference_group: statBlock?.reference_group ?? null,
+        significance_notes:
+          statBlock?.overall_test?.significance && Number.isFinite(statBlock.overall_test.p_value)
+            ? `${statBlock.overall_test.significance} (p=${formatPValue(statBlock.overall_test.p_value)})`
+            : statBlock?.note ?? null,
+        thresholds
+      },
+      {
+        onSuccess: (response) => {
+          setMetricInsights((prev) => ({ ...prev, [metricId]: response }));
+        },
+        onError: (error) => {
+          setMetricInsights((prev) => ({
+            ...prev,
+            [metricId]: {
+              summary: "Assistant unavailable. Try again after refreshing.",
+              bullets: [describeAssistantError(error)]
+            }
+          }));
+        },
+        onSettled: () => {
+          setPendingInsight((current) => (current === metricId ? null : current));
+        }
+      }
+    );
   };
 
   return (
@@ -614,6 +687,7 @@ export default function AnalysisBoard() {
                 overallTest.p_value
               )})`
             : null;
+        const insight = metricInsights[metric.id];
 
         return (
           <Box
@@ -673,6 +747,54 @@ export default function AnalysisBoard() {
                 <Typography variant="caption" color="text.secondary">
                   {overallSummary}
                 </Typography>
+              )}
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Button
+                  variant="outlined"
+                  size="small"
+                  onClick={() =>
+                    handleGenerateInsight(
+                      metric.id,
+                      metric.label,
+                      grouped.map((entry) => ({
+                        group: entry.group,
+                        mean: entry.mean,
+                        sd: entry.sd,
+                        count: entry.count
+                      })),
+                      statBlock
+                    )
+                  }
+                  disabled={pendingInsight === metric.id && interpretationMutation.isPending}
+                >
+                  {pendingInsight === metric.id && interpretationMutation.isPending ? "Generating insight…" : "AI insight"}
+                </Button>
+                {insight && (
+                  <Typography variant="caption" color="text.secondary">
+                    Insight ready
+                  </Typography>
+                )}
+              </Stack>
+              {insight && (
+                <Box
+                  sx={{
+                    borderLeft: "3px solid rgba(37,99,235,0.4)",
+                    pl: 1.5,
+                    py: 0.5,
+                    backgroundColor: "rgba(37,99,235,0.02)"
+                  }}
+                >
+                  <Typography variant="body2">{insight.summary}</Typography>
+                  {insight.bullets.length > 0 && (
+                    <Stack component="ul" spacing={0.25} sx={{ pl: 2, my: 0 }}>
+                      {insight.bullets.map((bullet, index) => (
+                        <Typography component="li" variant="caption" color="text.secondary" key={`${metric.id}-bullet-${index}`}>
+                          {bullet}
+                        </Typography>
+                      ))}
+                    </Stack>
+                  )}
+                </Box>
               )}
               <PlotlyChart
                 data={data}

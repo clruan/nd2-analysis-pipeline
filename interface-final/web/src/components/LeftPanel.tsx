@@ -27,7 +27,8 @@ import {
   useLoadStudy,
   useRunStatus,
   useThresholdRun,
-  useUpdateRatios
+  useUpdateRatios,
+  useStudyBuilderAssistant
 } from "../api/hooks";
 import type { ConfigScanResponse, RatioDefinition } from "../api/types";
 import { DEFAULT_RATIO_DEFINITIONS } from "../constants/metrics";
@@ -36,6 +37,12 @@ const sliderMarks = [0, 1000, 2000, 3000, 4000].map((value) => ({
   value,
   label: String(value)
 }));
+
+type AssistantChatEntry = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+};
 
 const defaultPalette = [
   "#2563eb",
@@ -83,6 +90,13 @@ const palettePresets: PalettePreset[] = [
     colors: ["#7c2d12", "#9a3412", "#c2410c", "#ea580c", "#f97316", "#fb923c", "#fdba74", "#fed7aa"]
   }
 ];
+
+const assistantIntroMessage: AssistantChatEntry = {
+  id: "assistant-intro",
+  role: "assistant",
+  content:
+    "Hi! I'm your study design assistant. Tell me about your experiment and I can suggest group structures or checklist items."
+};
 
 const getErrorMessage = (error: unknown) => {
   if (!error) return "Unknown error";
@@ -144,6 +158,10 @@ export default function LeftPanel() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [ratioDrafts, setRatioDrafts] = useState<RatioDefinition[]>(DEFAULT_RATIO_DEFINITIONS);
   const [studyRatioDrafts, setStudyRatioDrafts] = useState<RatioDefinition[]>(DEFAULT_RATIO_DEFINITIONS);
+  const [assistantMessages, setAssistantMessages] = useState<AssistantChatEntry[]>([assistantIntroMessage]);
+  const [assistantInput, setAssistantInput] = useState("");
+  const [assistantSuggestions, setAssistantSuggestions] = useState<Record<string, string[]>>({});
+  const [assistantQuestions, setAssistantQuestions] = useState<string[]>([]);
   const [palettePresetOverride, setPalettePresetOverride] = useState<string | null>(null);
 
   const scanMutation = useConfigScan();
@@ -154,6 +172,7 @@ export default function LeftPanel() {
   const statusQuery = useRunStatus(jobId);
   const uploadMutation = useFileUpload();
   const updateRatiosMutation = useUpdateRatios(study?.study_id ?? null);
+  const studyAssistantMutation = useStudyBuilderAssistant();
   const configInputRef = useRef<HTMLInputElement>(null);
   const resultsInputRef = useRef<HTMLInputElement>(null);
 
@@ -424,6 +443,24 @@ export default function LeftPanel() {
 
   const availableGroupNames = useMemo(() => Object.keys(groupMap).sort(), [groupMap]);
   const hasGroups = availableGroupNames.length > 0;
+  const assistantGroupContext = useMemo(() => {
+    if (Object.keys(groupMap).length > 0) {
+      return groupMap;
+    }
+    if (scanResult) {
+      return scanResult.groups.reduce<Record<string, string[]>>((acc, entry) => {
+        acc[entry.group_name] = entry.subjects.map((subject) => subject.subject_id);
+        return acc;
+      }, {});
+    }
+    if (studyGroups.length > 0) {
+      return studyGroups.reduce<Record<string, string[]>>((acc, group) => {
+        acc[group] = [];
+        return acc;
+      }, {});
+    }
+    return {};
+  }, [groupMap, scanResult, studyGroups]);
 
   useEffect(() => {
     if (!statusQuery.data) {
@@ -454,6 +491,74 @@ export default function LeftPanel() {
 
   const browseForFile = (inputRef: React.RefObject<HTMLInputElement>) => {
     inputRef.current?.click();
+  };
+
+  const createMessageId = (role: "user" | "assistant") =>
+    `${role}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+
+  const resetAssistantConversation = () => {
+    setAssistantMessages([assistantIntroMessage]);
+    setAssistantSuggestions({});
+    setAssistantQuestions([]);
+    setAssistantInput("");
+  };
+
+  const handleAssistantSubmit = () => {
+    const trimmed = assistantInput.trim();
+    if (!trimmed) {
+      return;
+    }
+    const userMessage: AssistantChatEntry = { id: createMessageId("user"), role: "user", content: trimmed };
+    const nextHistory = [...assistantMessages.slice(-7), userMessage];
+    setAssistantMessages(nextHistory);
+    setAssistantInput("");
+    studyAssistantMutation.mutate(
+      {
+        messages: nextHistory.map((entry) => ({ role: entry.role, content: entry.content })),
+        study_name: study?.study_name ?? scanResult?.study_name ?? undefined,
+        existing_groups: assistantGroupContext,
+        ratio_definitions: ratioDefinitions
+      },
+      {
+        onSuccess: (response) => {
+          const assistantMessage: AssistantChatEntry = {
+            id: createMessageId("assistant"),
+            role: "assistant",
+            content: response.reply?.trim() || "I've logged your request."
+          };
+          setAssistantMessages((prev) => [...prev.slice(-7), assistantMessage]);
+          if (response.suggested_groups && Object.keys(response.suggested_groups).length > 0) {
+            setAssistantSuggestions(response.suggested_groups);
+          }
+          setAssistantQuestions(response.next_questions || []);
+        },
+        onError: (error) => {
+          const assistantMessage: AssistantChatEntry = {
+            id: createMessageId("assistant"),
+            role: "assistant",
+            content: `I couldn't reach the language model (${getErrorMessage(error)}).`
+          };
+          setAssistantMessages((prev) => [...prev.slice(-7), assistantMessage]);
+        }
+      }
+    );
+  };
+
+  const handleApplyAssistantGroups = () => {
+    if (!Object.keys(assistantSuggestions).length) {
+      return;
+    }
+    setGroupMap((prev) => {
+      const next: Record<string, string[]> = { ...prev };
+      Object.entries(assistantSuggestions).forEach(([group, subjects]) => {
+        const normalized = subjects.map((subject) => subject.trim()).filter(Boolean);
+        const bucket = new Set(next[group] ?? []);
+        normalized.forEach((subject) => bucket.add(subject));
+        next[group] = Array.from(bucket).sort();
+      });
+      return next;
+    });
+    setAssistantSuggestions({});
   };
 
   const handleUploadSelection = async (
@@ -598,6 +703,120 @@ export default function LeftPanel() {
         {scanMutation.isError && <Alert severity="error">{getErrorMessage(scanMutation.error)}</Alert>}
         {configMutation.isError && <Alert severity="error">{getErrorMessage(configMutation.error)}</Alert>}
         {configError && <Alert severity="error">{configError}</Alert>}
+        <Stack spacing={0.75}>
+          <Stack direction="row" alignItems="center" justifyContent="space-between">
+            <Typography variant="subtitle1">LLM Study Assistant</Typography>
+            <Button variant="text" size="small" onClick={resetAssistantConversation} disabled={studyAssistantMutation.isPending}>
+              Reset
+            </Button>
+          </Stack>
+          <Typography variant="caption" color="text.secondary">
+            Describe your study, cohorts, or uncertainty. The assistant will suggest group structures and next steps.
+          </Typography>
+          <Stack
+            spacing={1}
+            sx={{
+              border: "1px solid rgba(15,23,42,0.08)",
+              borderRadius: 2,
+              p: 1.25,
+              backgroundColor: "rgba(15,23,42,0.02)"
+            }}
+          >
+            <Stack spacing={0.75} sx={{ maxHeight: 220, overflowY: "auto" }}>
+              {assistantMessages.map((message) => (
+                <Box
+                  key={message.id}
+                  sx={{
+                    alignSelf: message.role === "assistant" ? "flex-start" : "flex-end",
+                    borderRadius: 2,
+                    px: 1.25,
+                    py: 0.75,
+                    maxWidth: "100%",
+                    backgroundColor: message.role === "assistant" ? "rgba(37,99,235,0.08)" : "#2563eb",
+                    color: message.role === "assistant" ? "text.primary" : "#ffffff"
+                  }}
+                >
+                  <Typography variant="caption" color={message.role === "assistant" ? "text.secondary" : "rgba(255,255,255,0.82)"}>
+                    {message.role === "assistant" ? "Assistant" : "You"}
+                  </Typography>
+                  <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                    {message.content}
+                  </Typography>
+                </Box>
+              ))}
+              {studyAssistantMutation.isPending && (
+                <Typography variant="caption" color="text.secondary">
+                  Assistant is thinking…
+                </Typography>
+              )}
+            </Stack>
+            <Stack direction="row" spacing={1} alignItems="flex-start">
+              <TextField
+                placeholder="Ask about groups, replicates, thresholds..."
+                value={assistantInput}
+                onChange={(event) => setAssistantInput(event.target.value)}
+                fullWidth
+                size="small"
+                multiline
+                minRows={1}
+                maxRows={4}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    handleAssistantSubmit();
+                  }
+                }}
+              />
+              <Button
+                variant="contained"
+                size="small"
+                onClick={handleAssistantSubmit}
+                disabled={studyAssistantMutation.isPending || !assistantInput.trim()}
+              >
+                {studyAssistantMutation.isPending ? "Sending..." : "Send"}
+              </Button>
+            </Stack>
+          </Stack>
+          {assistantQuestions.length > 0 && (
+            <Stack direction="row" flexWrap="wrap" gap={1}>
+              {assistantQuestions.map((question) => (
+                <Chip
+                  key={question}
+                  label={question}
+                  size="small"
+                  variant="outlined"
+                  onClick={() => setAssistantInput(question)}
+                />
+              ))}
+            </Stack>
+          )}
+          {Object.keys(assistantSuggestions).length > 0 && (
+            <Box
+              sx={{
+                border: "1px solid rgba(37,99,235,0.2)",
+                borderRadius: 2,
+                p: 1.25,
+                backgroundColor: "rgba(37,99,235,0.04)"
+              }}
+            >
+              <Stack direction="row" alignItems="center" justifyContent="space-between">
+                <Typography variant="caption" color="text.secondary">
+                  Suggested groups
+                </Typography>
+                <Button variant="text" size="small" onClick={handleApplyAssistantGroups}>
+                  Apply to builder
+                </Button>
+              </Stack>
+              <Stack spacing={0.25} mt={0.5}>
+                {Object.entries(assistantSuggestions).map(([group, subjects]) => (
+                  <Typography key={group} variant="body2">
+                    {group}: {subjects.length ? subjects.join(", ") : "no subjects listed"}
+                  </Typography>
+                ))}
+              </Stack>
+            </Box>
+          )}
+        </Stack>
         {scanResult && (
           <Stack spacing={1.75}>
             <Typography variant="subtitle1">Group Builder</Typography>
