@@ -1,0 +1,22 @@
+# API artifacts
+api/__pycache__/
+api/.pytest_cache/
+api/.mypy_cache/
+api/services/__pycache__/
+api/services/generated_configs/
+api/services/generated_downloads/
+api/services/generated_previews/
+api/services/generated_results/
+api/services/uploaded_inputs/
+
+# Web artifacts
+web/node_modules/
+web/dist/
+web/.turbo/
+web/.vite/
+web/.eslintcache
+
+# General
+__pycache__/
+*.pyc
+.DS_Store
