@@ -207,44 +207,4 @@ class RatioUpdateResponse(BaseModel):
     ratios: List[RatioDefinition]
 
 
-class AssistantMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
-
-
-class StudyBuilderRequest(BaseModel):
-    messages: List[AssistantMessage]
-    study_name: Optional[str] = None
-    existing_groups: Dict[str, List[str]] = Field(default_factory=dict)
-    ratio_definitions: List[RatioDefinition] = Field(default_factory=list)
-
-
-class StudyBuilderResponse(BaseModel):
-    reply: str
-    suggested_study_name: Optional[str] = None
-    suggested_groups: Dict[str, List[str]] = Field(default_factory=dict)
-    next_questions: List[str] = Field(default_factory=list)
-
-
-class InterpretationGroupSummary(BaseModel):
-    group: str
-    mean: float
-    sd: Optional[float] = None
-    count: int
-
-
-class InterpretationRequest(BaseModel):
-    metric_id: str
-    metric_label: str
-    group_summaries: List[InterpretationGroupSummary]
-    reference_group: Optional[str] = None
-    significance_notes: Optional[str] = None
-    thresholds: Optional[Dict[str, int]] = None
-
-
-class InterpretationResponse(BaseModel):
-    summary: str
-    bullets: List[str]
-
-
 AnalyzeResponse.model_rebuild()

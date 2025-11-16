@@ -27,8 +27,7 @@ import {
   useLoadStudy,
   useRunStatus,
   useThresholdRun,
-  useUpdateRatios,
-  useStudyBuilderAssistant
+  useUpdateRatios
 } from "../api/hooks";
 import type { ConfigScanResponse, RatioDefinition } from "../api/types";
 import { DEFAULT_RATIO_DEFINITIONS } from "../constants/metrics";
@@ -37,12 +36,6 @@ const sliderMarks = [0, 1000, 2000, 3000, 4000].map((value) => ({
   value,
   label: String(value)
 }));
-
-type AssistantChatEntry = {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-};
 
 const defaultPalette = [
   "#2563eb",
@@ -91,11 +84,49 @@ const palettePresets: PalettePreset[] = [
   }
 ];
 
-const assistantIntroMessage: AssistantChatEntry = {
-  id: "assistant-intro",
-  role: "assistant",
-  content:
-    "Hi! I'm your study design assistant. Tell me about your experiment and I can suggest group structures or checklist items."
+type StepId = "nd2" | "config" | "run" | "load";
+type GuideState = "completed" | "active" | "upcoming";
+
+const baseSectionSx = {
+  borderRadius: 2,
+  p: 2,
+  transition: "border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease"
+} as const;
+
+const guideStateStyles: Record<GuideState, { borderColor: string; backgroundColor: string; boxShadow: string }> = {
+  completed: {
+    borderColor: "rgba(34,197,94,0.6)",
+    backgroundColor: "rgba(34,197,94,0.06)",
+    boxShadow: "none"
+  },
+  active: {
+    borderColor: "rgba(37,99,235,0.7)",
+    backgroundColor: "rgba(37,99,235,0.05)",
+    boxShadow: "0 0 0 3px rgba(37,99,235,0.15)"
+  },
+  upcoming: {
+    borderColor: "rgba(15,23,42,0.12)",
+    backgroundColor: "#ffffff",
+    boxShadow: "none"
+  }
+};
+
+const sectionStylesForState = (state: GuideState) => ({
+  ...baseSectionSx,
+  border: `1px solid ${guideStateStyles[state].borderColor}`,
+  backgroundColor: guideStateStyles[state].backgroundColor,
+  boxShadow: guideStateStyles[state].boxShadow
+});
+
+const normalizeGroupMapping = (groups: Record<string, string[]>): Record<string, string[]> => {
+  const normalized: Record<string, string[]> = {};
+  Object.entries(groups).forEach(([group, subjects]) => {
+    const cleaned = subjects.map((subject) => subject.trim()).filter(Boolean);
+    normalized[group] = Array.from(new Set(cleaned)).sort((a, b) =>
+      a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" })
+    );
+  });
+  return normalized;
 };
 
 const getErrorMessage = (error: unknown) => {
@@ -158,10 +189,6 @@ export default function LeftPanel() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [ratioDrafts, setRatioDrafts] = useState<RatioDefinition[]>(DEFAULT_RATIO_DEFINITIONS);
   const [studyRatioDrafts, setStudyRatioDrafts] = useState<RatioDefinition[]>(DEFAULT_RATIO_DEFINITIONS);
-  const [assistantMessages, setAssistantMessages] = useState<AssistantChatEntry[]>([assistantIntroMessage]);
-  const [assistantInput, setAssistantInput] = useState("");
-  const [assistantSuggestions, setAssistantSuggestions] = useState<Record<string, string[]>>({});
-  const [assistantQuestions, setAssistantQuestions] = useState<string[]>([]);
   const [palettePresetOverride, setPalettePresetOverride] = useState<string | null>(null);
 
   const scanMutation = useConfigScan();
@@ -172,7 +199,6 @@ export default function LeftPanel() {
   const statusQuery = useRunStatus(jobId);
   const uploadMutation = useFileUpload();
   const updateRatiosMutation = useUpdateRatios(study?.study_id ?? null);
-  const studyAssistantMutation = useStudyBuilderAssistant();
   const configInputRef = useRef<HTMLInputElement>(null);
   const resultsInputRef = useRef<HTMLInputElement>(null);
 
@@ -443,24 +469,10 @@ export default function LeftPanel() {
 
   const availableGroupNames = useMemo(() => Object.keys(groupMap).sort(), [groupMap]);
   const hasGroups = availableGroupNames.length > 0;
-  const assistantGroupContext = useMemo(() => {
-    if (Object.keys(groupMap).length > 0) {
-      return groupMap;
-    }
-    if (scanResult) {
-      return scanResult.groups.reduce<Record<string, string[]>>((acc, entry) => {
-        acc[entry.group_name] = entry.subjects.map((subject) => subject.subject_id);
-        return acc;
-      }, {});
-    }
-    if (studyGroups.length > 0) {
-      return studyGroups.reduce<Record<string, string[]>>((acc, group) => {
-        acc[group] = [];
-        return acc;
-      }, {});
-    }
-    return {};
-  }, [groupMap, scanResult, studyGroups]);
+  const builderSummary = useMemo(() => {
+    const subjectCount = Object.values(groupMap).reduce((acc, subjects) => acc + subjects.length, 0);
+    return { groupCount: availableGroupNames.length, subjectCount };
+  }, [availableGroupNames, groupMap]);
 
   useEffect(() => {
     if (!statusQuery.data) {
@@ -493,74 +505,6 @@ export default function LeftPanel() {
     inputRef.current?.click();
   };
 
-  const createMessageId = (role: "user" | "assistant") =>
-    `${role}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-
-  const resetAssistantConversation = () => {
-    setAssistantMessages([assistantIntroMessage]);
-    setAssistantSuggestions({});
-    setAssistantQuestions([]);
-    setAssistantInput("");
-  };
-
-  const handleAssistantSubmit = () => {
-    const trimmed = assistantInput.trim();
-    if (!trimmed) {
-      return;
-    }
-    const userMessage: AssistantChatEntry = { id: createMessageId("user"), role: "user", content: trimmed };
-    const nextHistory = [...assistantMessages.slice(-7), userMessage];
-    setAssistantMessages(nextHistory);
-    setAssistantInput("");
-    studyAssistantMutation.mutate(
-      {
-        messages: nextHistory.map((entry) => ({ role: entry.role, content: entry.content })),
-        study_name: study?.study_name ?? scanResult?.study_name ?? undefined,
-        existing_groups: assistantGroupContext,
-        ratio_definitions: ratioDefinitions
-      },
-      {
-        onSuccess: (response) => {
-          const assistantMessage: AssistantChatEntry = {
-            id: createMessageId("assistant"),
-            role: "assistant",
-            content: response.reply?.trim() || "I've logged your request."
-          };
-          setAssistantMessages((prev) => [...prev.slice(-7), assistantMessage]);
-          if (response.suggested_groups && Object.keys(response.suggested_groups).length > 0) {
-            setAssistantSuggestions(response.suggested_groups);
-          }
-          setAssistantQuestions(response.next_questions || []);
-        },
-        onError: (error) => {
-          const assistantMessage: AssistantChatEntry = {
-            id: createMessageId("assistant"),
-            role: "assistant",
-            content: `I couldn't reach the language model (${getErrorMessage(error)}).`
-          };
-          setAssistantMessages((prev) => [...prev.slice(-7), assistantMessage]);
-        }
-      }
-    );
-  };
-
-  const handleApplyAssistantGroups = () => {
-    if (!Object.keys(assistantSuggestions).length) {
-      return;
-    }
-    setGroupMap((prev) => {
-      const next: Record<string, string[]> = { ...prev };
-      Object.entries(assistantSuggestions).forEach(([group, subjects]) => {
-        const normalized = subjects.map((subject) => subject.trim()).filter(Boolean);
-        const bucket = new Set(next[group] ?? []);
-        normalized.forEach((subject) => bucket.add(subject));
-        next[group] = Array.from(bucket).sort();
-      });
-      return next;
-    });
-    setAssistantSuggestions({});
-  };
-
   const handleUploadSelection = async (
     event: React.ChangeEvent<HTMLInputElement>,
     category: "config" | "threshold_results"
@@ -590,6 +534,71 @@ export default function LeftPanel() {
     }
   };
 
+  useEffect(() => {
+    if (study?.nd2_root && !inputDir) {
+      setInputDir(study.nd2_root);
+    }
+  }, [study?.nd2_root, inputDir]);
+
+  const workflowSteps = useMemo<Array<{ id: StepId; title: string; description: string; completed: boolean; state: GuideState }>>(() => {
+    const nd2Complete = Boolean(inputDir.trim());
+    const configComplete = Boolean(configPath && hasGroups);
+    const runComplete =
+      Boolean(resultsPath) || Boolean(statusQuery.data?.state === "succeeded" && statusQuery.data.output_path);
+    const loadComplete = Boolean(study);
+    const base: Array<{ id: StepId; title: string; description: string; completed: boolean }> = [
+      {
+        id: "nd2",
+        title: "Input ND2 directory",
+        description: "Point to the folder with ND2 files, then scan for subjects.",
+        completed: nd2Complete
+      },
+      {
+        id: "config",
+        title: "Configure groups",
+        description: "Edit detected cohorts and save a config JSON.",
+        completed: configComplete
+      },
+      {
+        id: "run",
+        title: "Run thresholds",
+        description: "Generate threshold results for the current config.",
+        completed: runComplete
+      },
+      {
+        id: "load",
+        title: "Load study",
+        description: "Load the latest results JSON to unlock analysis.",
+        completed: loadComplete
+      }
+    ];
+    const firstPending = base.find((step) => !step.completed)?.id ?? null;
+    return base.map((step) => ({
+      ...step,
+      state: step.completed ? "completed" : step.id === firstPending ? "active" : "upcoming"
+    }));
+  }, [
+    configPath,
+    hasGroups,
+    inputDir,
+    resultsPath,
+    statusQuery.data?.output_path,
+    statusQuery.data?.state,
+    study
+  ]);
+
+  const stepStateById = useMemo(
+    () =>
+      workflowSteps.reduce<Record<StepId, GuideState>>((acc, step) => {
+        acc[step.id] = step.state;
+        return acc;
+      }, {} as Record<StepId, GuideState>),
+    [workflowSteps]
+  );
+
+  const getStepState = (stepId: StepId): GuideState => stepStateById[stepId] ?? "upcoming";
+  const sectionSx = (stepId: StepId) => sectionStylesForState(getStepState(stepId));
+
   return (
     <Stack spacing={2} px={3} py={3} sx={{ minHeight: "100%" }}>
       <Box>
@@ -601,425 +610,346 @@ export default function LeftPanel() {
         </Typography>
       </Box>
 
-      <Stack spacing={1.5}>
-        <TextField
-          label="ND2 Input Directory"
-          value={inputDir}
-          onChange={(event) => setInputDir(event.target.value)}
-          size="small"
-          fullWidth
-          placeholder="/path/to/nd2"
-        />
-        <Stack direction="row" spacing={1}>
-          <Button
-            variant="outlined"
-            size="small"
-            disabled={!inputDir || scanMutation.isPending}
-            onClick={async () => {
-              try {
-                const response = await scanMutation.mutateAsync({ input_dir: inputDir });
-                setScanResult(response);
-                const groups: Record<string, string[]> = {};
-                response.groups.forEach((group) => {
-                  groups[group.group_name] = group.subjects.map((subject) => subject.subject_id);
-                });
-                setGroupMap(groups);
-                setGroupsJson(JSON.stringify(groups, null, 2));
-                setConfigError(null);
-                setPixelSize("");
-              } catch (error) {
-                /* handled below */
-              }
-            }}
-          >
-            {scanMutation.isPending ? "Scanning..." : "Scan Directory"}
-          </Button>
-          <Button
-            variant="outlined"
-            size="small"
-            disabled={!scanResult || !hasGroups || configMutation.isPending}
-            onClick={async () => {
-              if (!scanResult) return;
-              if (!hasGroups) {
-                setConfigError("Add at least one group with subjects before creating a config.");
-                return;
-              }
-              let parsedGroups: Record<string, string[]>;
-              try {
-                if (Object.keys(groupMap).length > 0) {
-                  parsedGroups = Object.fromEntries(
-                    Object.entries(groupMap).map(([key, value]) => [key, Array.from(new Set(value.map(String))).sort()])
-                  );
-                } else {
-                  parsedGroups = JSON.parse(groupsJson || "{}");
-                }
-                if (typeof parsedGroups !== "object" || parsedGroups === null || Array.isArray(parsedGroups)) {
-                  throw new Error("Groups must map group names to arrays of subject IDs.");
-                }
-                Object.entries(parsedGroups).forEach(([key, value]) => {
-                  if (!Array.isArray(value)) {
-                    throw new Error(`Group "${key}" must contain an array of subject IDs.`);
-                  }
-                  parsedGroups[key] = Array.from(new Set(value.map(String))).sort();
-                });
-                setConfigError(null);
-              } catch (error) {
-                setConfigError(getErrorMessage(error));
-                return;
-              }
-              try {
-                const response = await configMutation.mutateAsync({
-                  input_dir: scanResult.input_dir,
-                  study_name: scanResult.study_name,
-                  groups: parsedGroups,
-                  pixel_size_um: pixelSize ? Number(pixelSize) : undefined,
-                  output_path: configPath || undefined,
-                  ratios: ratioDrafts
-                });
-                setConfigPath(response.config_path);
-                setConfigError(null);
-              } catch (error) {
-                /* handled below */
-              }
-            }}
-          >
-            {configMutation.isPending ? "Saving..." : "Create Config"}
-          </Button>
-        </Stack>
-        {scanSummary && (
-          <Typography variant="caption" color="text.secondary">
-            {scanSummary.groupCount} groups • {scanSummary.subjectCount} subjects • {scanSummary.files} ND2 files detected
-          </Typography>
-        )}
-        {scanResult && (
-          <Box sx={{ maxHeight: 120, overflowY: "auto", px: 1, py: 0.5, borderRadius: 1, backgroundColor: "rgba(255,255,255,0.03)" }}>
-            {scanResult.groups.map((group) => (
-              <Typography key={group.group_name} variant="caption" display="block">
-                {group.group_name}: {group.subjects.length} subjects
+      <Box
+        sx={{
+          borderRadius: 2,
+          border: "1px solid rgba(15,23,42,0.1)",
+          p: 2,
+          backgroundColor: "#ffffff"
+        }}
+      >
+        <Typography variant="subtitle2" gutterBottom>
+          Interactive workflow
+        </Typography>
+        <Stack spacing={1}>
+          {workflowSteps.map((step, index) => (
+            <Box
+              key={step.id}
+              sx={{ borderRadius: 1.5, p: 1, backgroundColor: step.state === "active" ? "rgba(37,99,235,0.08)" : "transparent" }}
+            >
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Chip
+                  label={`Step ${index + 1}`}
+                  size="small"
+                  color={step.state === "completed" ? "success" : step.state === "active" ? "primary" : "default"}
+                  variant={step.state === "upcoming" ? "outlined" : "filled"}
+                />
+                <Typography variant="body2">{step.title}</Typography>
+              </Stack>
+              <Typography variant="caption" color="text.secondary" sx={{ ml: 5 }}>
+                {step.description}
               </Typography>
-            ))}
-          </Box>
-        )}
-        {scanMutation.isError && <Alert severity="error">{getErrorMessage(scanMutation.error)}</Alert>}
-        {configMutation.isError && <Alert severity="error">{getErrorMessage(configMutation.error)}</Alert>}
-        {configError && <Alert severity="error">{configError}</Alert>}
-        <Stack spacing={0.75}>
-          <Stack direction="row" alignItems="center" justifyContent="space-between">
-            <Typography variant="subtitle1">LLM Study Assistant</Typography>
-            <Button variant="text" size="small" onClick={resetAssistantConversation} disabled={studyAssistantMutation.isPending}>
-              Reset
+            </Box>
+          ))}
+        </Stack>
+      </Box>
+
+
+      <Box sx={sectionSx("nd2")}>
+        <Stack spacing={1.5}>
+          <TextField
+            label="ND2 Input Directory"
+            value={inputDir}
+            onChange={(event) => setInputDir(event.target.value)}
+            size="small"
+            fullWidth
+            placeholder="/path/to/nd2"
+          />
+          <Stack direction="row" spacing={1}>
+            <Button
+              variant="outlined"
+              size="small"
+              disabled={!inputDir || scanMutation.isPending}
+              onClick={async () => {
+                try {
+                  const response = await scanMutation.mutateAsync({ input_dir: inputDir });
+                  setScanResult(response);
+                  const groups: Record<string, string[]> = {};
+                  response.groups.forEach((group) => {
+                    groups[group.group_name] = group.subjects.map((subject) => subject.subject_id);
+                  });
+                  const normalized = normalizeGroupMapping(groups);
+                  setGroupMap(normalized);
+                  setGroupsJson(JSON.stringify(normalized, null, 2));
+                  setConfigError(null);
+                  setPixelSize("");
+                } catch (error) {
+                  /* handled below */
+                }
+              }}
+            >
+              {scanMutation.isPending ? "Scanning..." : "Scan Directory"}
             </Button>
           </Stack>
           <Typography variant="caption" color="text.secondary">
-            Describe your study, cohorts, or uncertainty. The assistant will suggest group structures and next steps.
+            {builderSummary.groupCount} editable groups • {builderSummary.subjectCount} subjects in the builder.
           </Typography>
-          <Stack
-            spacing={1}
-            sx={{
-              border: "1px solid rgba(15,23,42,0.08)",
-              borderRadius: 2,
-              p: 1.25,
-              backgroundColor: "rgba(15,23,42,0.02)"
-            }}
-          >
-            <Stack spacing={0.75} sx={{ maxHeight: 220, overflowY: "auto" }}>
-              {assistantMessages.map((message) => (
-                <Box
-                  key={message.id}
-                  sx={{
-                    alignSelf: message.role === "assistant" ? "flex-start" : "flex-end",
-                    borderRadius: 2,
-                    px: 1.25,
-                    py: 0.75,
-                    maxWidth: "100%",
-                    backgroundColor: message.role === "assistant" ? "rgba(37,99,235,0.08)" : "#2563eb",
-                    color: message.role === "assistant" ? "text.primary" : "#ffffff"
-                  }}
-                >
-                  <Typography variant="caption" color={message.role === "assistant" ? "text.secondary" : "rgba(255,255,255,0.82)"}>
-                    {message.role === "assistant" ? "Assistant" : "You"}
-                  </Typography>
-                  <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                    {message.content}
-                  </Typography>
-                </Box>
-              ))}
-              {studyAssistantMutation.isPending && (
-                <Typography variant="caption" color="text.secondary">
-                  Assistant is thinking…
-                </Typography>
-              )}
-            </Stack>
-            <Stack direction="row" spacing={1} alignItems="flex-start">
-              <TextField
-                placeholder="Ask about groups, replicates, thresholds..."
-                value={assistantInput}
-                onChange={(event) => setAssistantInput(event.target.value)}
-                fullWidth
-                size="small"
-                multiline
-                minRows={1}
-                maxRows={4}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    handleAssistantSubmit();
-                  }
-                }}
-              />
-              <Button
-                variant="contained"
-                size="small"
-                onClick={handleAssistantSubmit}
-                disabled={studyAssistantMutation.isPending || !assistantInput.trim()}
-              >
-                {studyAssistantMutation.isPending ? "Sending..." : "Send"}
-              </Button>
-            </Stack>
-          </Stack>
-          {assistantQuestions.length > 0 && (
-            <Stack direction="row" flexWrap="wrap" gap={1}>
-              {assistantQuestions.map((question) => (
-                <Chip
-                  key={question}
-                  label={question}
-                  size="small"
-                  variant="outlined"
-                  onClick={() => setAssistantInput(question)}
-                />
-              ))}
-            </Stack>
+          {scanSummary && (
+            <Typography variant="caption" color="text.secondary">
+              Last scan detected {scanSummary.groupCount} groups across {scanSummary.subjectCount} subjects ({scanSummary.files} ND2 files).
+            </Typography>
           )}
-          {Object.keys(assistantSuggestions).length > 0 && (
-            <Box
-              sx={{
-                border: "1px solid rgba(37,99,235,0.2)",
-                borderRadius: 2,
-                p: 1.25,
-                backgroundColor: "rgba(37,99,235,0.04)"
-              }}
-            >
-              <Stack direction="row" alignItems="center" justifyContent="space-between">
-                <Typography variant="caption" color="text.secondary">
-                  Suggested groups
+          {availableGroupNames.length > 0 && (
+            <Box sx={{ maxHeight: 120, overflowY: "auto", px: 1, py: 0.5, borderRadius: 1, backgroundColor: "rgba(255,255,255,0.6)" }}>
+              {availableGroupNames.map((group) => (
+                <Typography key={group} variant="caption" display="block">
+                  {group}: {(groupMap[group] ?? []).length} subjects
                 </Typography>
-                <Button variant="text" size="small" onClick={handleApplyAssistantGroups}>
-                  Apply to builder
-                </Button>
-              </Stack>
-              <Stack spacing={0.25} mt={0.5}>
-                {Object.entries(assistantSuggestions).map(([group, subjects]) => (
-                  <Typography key={group} variant="body2">
-                    {group}: {subjects.length ? subjects.join(", ") : "no subjects listed"}
-                  </Typography>
-                ))}
-              </Stack>
+              ))}
             </Box>
           )}
+          {scanMutation.isError && <Alert severity="error">{getErrorMessage(scanMutation.error)}</Alert>}
         </Stack>
-        {scanResult && (
+      </Box>
+
+      <Box sx={sectionSx("config")}>
+        {scanResult || hasGroups ? (
           <Stack spacing={1.75}>
-            <Typography variant="subtitle1">Group Builder</Typography>
-            <Typography variant="caption" color="text.secondary">
-              Add each treatment group and list the subject IDs that belong to it. You can still fall back to the generated JSON if you prefer.
-            </Typography>
-            <Stack direction="row" spacing={1}>
-              <TextField
-                label="New group name"
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Button
+                variant="outlined"
                 size="small"
-                fullWidth
-                value={newGroupName}
-                onChange={(event) => setNewGroupName(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    handleAddGroup();
+                disabled={!hasGroups || configMutation.isPending || !scanResult}
+                onClick={async () => {
+                  if (!scanResult) return;
+                  if (!hasGroups) {
+                    setConfigError("Add at least one group with subjects before creating a config.");
+                    return;
                   }
-                }}
-              />
-              <Button variant="outlined" size="small" onClick={handleAddGroup} disabled={!newGroupName.trim()}>
-                Add Group
-              </Button>
-            </Stack>
-            {availableGroupNames.length === 0 ? (
-              <Typography variant="caption" color="text.secondary">
-                No groups yet. Add a group above, then assign subjects to it.
-              </Typography>
-            ) : (
-              <Stack spacing={1.25}>
-                {availableGroupNames.map((groupName) => {
-                  const selectedSubjects = groupMap[groupName] ?? [];
-                  const suggestions = scanDefaults[groupName] ?? [];
-                  const pendingSubject = subjectInputs[groupName] ?? "";
-                  return (
-                    <Box
-                      key={groupName}
-                      sx={{
-                        borderRadius: 1,
-                        border: "1px solid rgba(15,23,42,0.08)",
-                        backgroundColor: "rgba(15,23,42,0.02)",
-                        p: 1.5
-                      }}
-                    >
-                      <Stack direction="row" alignItems="center" justifyContent="space-between">
-                        <Typography variant="subtitle2">{groupName}</Typography>
-                        <Button variant="text" size="small" color="error" onClick={() => handleRemoveGroup(groupName)}>
-                          Remove group
-                        </Button>
-                      </Stack>
-                      <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 1 }}>
-                        <TextField
-                          label="Add subject ID"
-                          size="small"
-                          value={pendingSubject}
-                          onChange={(event) =>
-                            setSubjectInputs((prev) => ({
-                              ...prev,
-                              [groupName]: event.target.value
-                            }))
-                          }
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter") {
-                              event.preventDefault();
-                              handleAddSubject(groupName, pendingSubject);
-                            }
-                          }}
-                        />
-                        <Button
-                          variant="outlined"
-                          size="small"
-                          onClick={() => handleAddSubject(groupName, pendingSubject)}
-                          disabled={!pendingSubject.trim()}
-                        >
-                          Add subject
-                        </Button>
-                      </Stack>
-                      {suggestions.length > 0 && (
-                        <Stack direction="row" flexWrap="wrap" gap={1} sx={{ mt: 1 }}>
-                          {suggestions.map((subjectId) => (
-                            <Chip
-                              key={`${groupName}-${subjectId}-suggestion`}
-                              label={subjectId}
-                              size="small"
-                              variant="outlined"
-                              onClick={() => handleAddSubject(groupName, subjectId)}
-                            />
-                          ))}
-                        </Stack>
-                      )}
-                      <Stack direction="row" flexWrap="wrap" gap={1} sx={{ mt: 1 }}>
-                        {selectedSubjects.length === 0 ? (
-                          <Typography variant="caption" color="text.secondary">
-                            No subjects assigned yet.
-                          </Typography>
-                        ) : (
-                          selectedSubjects.map((subjectId) => (
-                            <Chip
-                              key={`${groupName}-${subjectId}`}
-                              label={subjectId}
-                              size="small"
-                              onDelete={() => handleRemoveSubject(groupName, subjectId)}
-                            />
-                          ))
-                        )}
-                      </Stack>
-                    </Box>
-                  );
-                })}
-              </Stack>
-            )}
-            <Stack direction="row" spacing={1}>
-              <Button
-                variant="text"
-                size="small"
-                disabled={Object.keys(scanDefaults).length === 0}
-                onClick={() => {
-                  setGroupMap(
-                    Object.fromEntries(Object.entries(scanDefaults).map(([key, value]) => [key, [...value]]))
-                  );
-                  setSubjectInputs({});
-                  setConfigError(null);
-                }}
-              >
-                Reset to scanned defaults
-              </Button>
-              <Button
-                variant="text"
-                size="small"
-                onClick={() => {
+                  let parsedGroups: Record<string, string[]>;
                   try {
-                    const parsed = JSON.parse(groupsJson || "{}");
-                    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-                      throw new Error("Groups JSON must map group names to arrays of subject IDs.");
-                    }
-                    const next: Record<string, string[]> = {};
-                    Object.entries(parsed).forEach(([key, value]) => {
-                      if (!Array.isArray(value)) {
-                        throw new Error(`Group "${key}" must list subject IDs as an array.`);
+                    if (Object.keys(groupMap).length > 0) {
+                      parsedGroups = normalizeGroupMapping(groupMap);
+                    } else {
+                      parsedGroups = JSON.parse(groupsJson || "{}");
+                      if (typeof parsedGroups !== "object" || parsedGroups === null || Array.isArray(parsedGroups)) {
+                        throw new Error("Groups must map group names to arrays of subject IDs.");
                       }
-                      next[key] = Array.from(new Set(value.map(String))).sort();
-                    });
-                    setGroupMap(next);
-                    setSubjectInputs({});
+                      parsedGroups = normalizeGroupMapping(parsedGroups);
+                    }
                     setConfigError(null);
                   } catch (error) {
                     setConfigError(getErrorMessage(error));
+                    return;
+                  }
+                  try {
+                    const response = await configMutation.mutateAsync({
+                      input_dir: scanResult.input_dir,
+                      study_name: scanResult.study_name,
+                      groups: parsedGroups,
+                      pixel_size_um: pixelSize ? Number(pixelSize) : undefined,
+                      output_path: configPath || undefined,
+                      ratios: ratioDrafts
+                    });
+                    setConfigPath(response.config_path);
+                    setGroupsJson(JSON.stringify(parsedGroups, null, 2));
+                    setGroupMap(parsedGroups);
+                    setSubjectInputs({});
+                    setConfigError(null);
+                  } catch (error) {
+                    /* handled below */
                   }
                 }}
               >
-                Apply advanced JSON
+                {configMutation.isPending ? "Saving..." : "Create Config"}
               </Button>
+              <Typography variant="caption" color="text.secondary">
+                Save a config JSON once the group assignments look correct.
+              </Typography>
             </Stack>
-            <TextField
-              label="Groups JSON (advanced)"
-              value={groupsJson}
-              onChange={(event) => setGroupsJson(event.target.value)}
-              multiline
-              minRows={4}
-              maxRows={12}
-              size="small"
-              fullWidth
-              helperText="Automatically generated from your selections. Edit and apply to overwrite the builder."
-            />
-          </Stack>
-        )}
-        {scanResult && (
-          <Stack spacing={1}>
-            <Stack direction="row" alignItems="center" justifyContent="space-between">
-              <Typography variant="subtitle1">Config Ratios</Typography>
-              <Button variant="text" size="small" onClick={resetConfigRatios} disabled={configMutation.isPending}>
-                Reset
-              </Button>
-            </Stack>
-            <Typography variant="caption" color="text.secondary">
-              Choose which channel ratios should be available when collaborators load this config.
-            </Typography>
-            {ratioDrafts.map((ratio, index) => (
-              <Box
-                key={ratio.id ?? `config-ratio-${index}`}
-                sx={{
-                  border: "1px solid rgba(15,23,42,0.08)",
-                  borderRadius: 2,
-                  p: 1.25,
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 1
-                }}
-              >
+            {configMutation.isError && <Alert severity="error">{getErrorMessage(configMutation.error)}</Alert>}
+            {configError && <Alert severity="error">{configError}</Alert>}
+            <Stack spacing={1.75}>
+              <Typography variant="subtitle1">Group Builder</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Add each treatment group and list the subject IDs that belong to it. You can still fall back to the generated JSON if you prefer.
+              </Typography>
+              <Stack direction="row" spacing={1}>
                 <TextField
-                  label="Label"
+                  label="New group name"
                   size="small"
                   fullWidth
-                  value={ratio.label}
-                  onChange={(event) => handleConfigRatioChange(index, { label: event.target.value })}
+                  value={newGroupName}
+                  onChange={(event) => setNewGroupName(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      handleAddGroup();
+                    }
+                  }}
                 />
-                <Stack direction={{ xs: "column", sm: "row" }} spacing={1} useFlexGap alignItems={{ sm: "center" }}>
+                <Button variant="outlined" size="small" onClick={handleAddGroup} disabled={!newGroupName.trim()}>
+                  Add Group
+                </Button>
+              </Stack>
+              {availableGroupNames.length === 0 ? (
+                <Typography variant="caption" color="text.secondary">
+                  No groups yet. Add a group above, then assign subjects to it.
+                </Typography>
+              ) : (
+                <Stack spacing={1.25}>
+                  {availableGroupNames.map((groupName) => {
+                    const selectedSubjects = groupMap[groupName] ?? [];
+                    const suggestions = scanDefaults[groupName] ?? [];
+                    const pendingSubject = subjectInputs[groupName] ?? "";
+                    return (
+                      <Box
+                        key={groupName}
+                        sx={{
+                          borderRadius: 1,
+                          border: "1px solid rgba(15,23,42,0.08)",
+                          backgroundColor: "rgba(15,23,42,0.02)",
+                          p: 1.5
+                        }}
+                      >
+                        <Stack direction="row" alignItems="center" justifyContent="space-between">
+                          <Typography variant="subtitle2">{groupName}</Typography>
+                          <Button variant="text" size="small" color="error" onClick={() => handleRemoveGroup(groupName)}>
+                            Remove group
+                          </Button>
+                        </Stack>
+                        <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 1 }}>
+                          <TextField
+                            label="Add subject ID"
+                            size="small"
+                            value={pendingSubject}
+                            onChange={(event) =>
+                              setSubjectInputs((prev) => ({
+                                ...prev,
+                                [groupName]: event.target.value
+                              }))
+                            }
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                handleAddSubject(groupName, pendingSubject);
+                              }
+                            }}
+                          />
+                          <Button
+                            variant="outlined"
+                            size="small"
+                            onClick={() => handleAddSubject(groupName, pendingSubject)}
+                            disabled={!pendingSubject.trim()}
+                          >
+                            Add subject
+                          </Button>
+                        </Stack>
+                        {suggestions.length > 0 && (
+                          <Stack direction="row" flexWrap="wrap" gap={1} sx={{ mt: 1 }}>
+                            {suggestions.map((subjectId) => (
+                              <Chip
+                                key={`${groupName}-${subjectId}-suggestion`}
+                                label={subjectId}
+                                size="small"
+                                variant="outlined"
+                                onClick={() => handleAddSubject(groupName, subjectId)}
+                              />
+                            ))}
+                          </Stack>
+                        )}
+                        <Stack direction="row" flexWrap="wrap" gap={1} sx={{ mt: 1 }}>
+                          {selectedSubjects.length === 0 ? (
+                            <Typography variant="caption" color="text.secondary">
+                              No subjects assigned yet.
+                            </Typography>
+                          ) : (
+                            selectedSubjects.map((subjectId) => (
+                              <Chip
+                                key={`${groupName}-${subjectId}`}
+                                label={subjectId}
+                                size="small"
+                                onDelete={() => handleRemoveSubject(groupName, subjectId)}
+                              />
+                            ))
+                          )}
+                        </Stack>
+                      </Box>
+                    );
+                  })}
+                </Stack>
+              )}
+              <Stack direction="row" spacing={1}>
+                <Button
+                  variant="text"
+                  size="small"
+                  disabled={Object.keys(scanDefaults).length === 0}
+                  onClick={() => {
+                    const reset = Object.fromEntries(Object.entries(scanDefaults).map(([key, value]) => [key, [...value]]));
+                    const normalized = normalizeGroupMapping(reset);
+                    setGroupMap(normalized);
+                    setGroupsJson(JSON.stringify(normalized, null, 2));
+                    setSubjectInputs({});
+                    setConfigError(null);
+                  }}
+                >
+                  Reset to scanned defaults
+                </Button>
+                <Button
+                  variant="text"
+                  size="small"
+                  onClick={() => {
+                    try {
+                      const parsed = JSON.parse(groupsJson || "{}");
+                      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+                        throw new Error("Group JSON must map group names to arrays of subject IDs.");
+                      }
+                      const normalized = normalizeGroupMapping(parsed as Record<string, string[]>);
+                      setGroupMap(normalized);
+                      setGroupsJson(JSON.stringify(normalized, null, 2));
+                      setSubjectInputs({});
+                      setConfigError(null);
+                    } catch (error) {
+                      setConfigError(getErrorMessage(error));
+                    }
+                  }}
+                >
+                  Apply JSON override
+                </Button>
+              </Stack>
+              <TextField
+                label="Group JSON override"
+                value={groupsJson}
+                onChange={(event) => setGroupsJson(event.target.value)}
+                multiline
+                minRows={4}
+                maxRows={12}
+                size="small"
+                fullWidth
+                helperText="JSON mapping of group -> subjects. Edit and choose Apply JSON override to sync the builder."
+              />
+            </Stack>
+            <Stack spacing={1}>
+              <Stack direction="row" alignItems="center" justifyContent="space-between">
+                <Typography variant="subtitle1">Config Ratios</Typography>
+                <Button variant="text" size="small" onClick={resetConfigRatios} disabled={configMutation.isPending}>
+                  Reset
+                </Button>
+              </Stack>
+              <Typography variant="caption" color="text.secondary">
+                Choose which channel ratios should be available when collaborators load this config.
+              </Typography>
+              {ratioDrafts.map((ratio, index) => (
+                <Box
+                  key={ratio.id ?? `config-ratio-${index}`}
+                  sx={{
+                    display: "grid",
+                    gridTemplateColumns: { xs: "1fr", sm: "1fr repeat(2, 160px) auto" },
+                    gap: 8,
+                    alignItems: "center"
+                  }}
+                >
+                  <TextField
+                    label="Label"
+                    size="small"
+                    fullWidth
+                    value={ratio.label}
+                    onChange={(event) => handleConfigRatioChange(index, { label: event.target.value })}
+                  />
                   <TextField
                     label="Numerator"
                     size="small"
                     type="number"
-                    fullWidth
-                    sx={{ flex: 1, minWidth: 0 }}
                     inputProps={{ min: 1, max: 3 }}
                     value={ratio.numerator_channel}
                     onChange={(event) => handleConfigRatioChange(index, { numerator_channel: Number(event.target.value) })}
@@ -1028,8 +958,6 @@ export default function LeftPanel() {
                     label="Denominator"
                     size="small"
                     type="number"
-                    fullWidth
-                    sx={{ flex: 1, minWidth: 0 }}
                     inputProps={{ min: 1, max: 3 }}
                     value={ratio.denominator_channel}
                     onChange={(event) =>
@@ -1042,41 +970,41 @@ export default function LeftPanel() {
                     color="error"
                     onClick={() => removeConfigRatio(index)}
                     disabled={ratioDrafts.length <= 1}
-                    sx={{
-                      alignSelf: { xs: "flex-start", sm: "stretch" },
-                      whiteSpace: "nowrap"
-                    }}
+                    sx={{ justifySelf: { xs: "flex-start", sm: "center" } }}
                   >
                     Remove
                   </Button>
-                </Stack>
-              </Box>
-            ))}
-            <Button
-              variant="outlined"
+                </Box>
+              ))}
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={addConfigRatio}
+                disabled={ratioDrafts.length >= 6 || configMutation.isPending}
+              >
+                Add ratio
+              </Button>
+            </Stack>
+            <TextField
+              label="Pixel size (µm)"
+              value={pixelSize}
+              onChange={(event) => setPixelSize(event.target.value)}
               size="small"
-              onClick={addConfigRatio}
-              disabled={ratioDrafts.length >= 6 || configMutation.isPending}
-            >
-              Add ratio
-            </Button>
+              type="number"
+              inputProps={{ step: "0.001" }}
+            />
           </Stack>
+        ) : (
+          <Typography variant="caption" color="text.secondary">
+            Scan an ND2 directory to unlock group editing, JSON overrides, ratio presets, and config exports.
+          </Typography>
         )}
-        {scanResult && (
-          <TextField
-            label="Pixel size (µm)"
-            value={pixelSize}
-            onChange={(event) => setPixelSize(event.target.value)}
-            size="small"
-            type="number"
-            inputProps={{ step: "0.001" }}
-          />
-        )}
-      </Stack>
+      </Box>
 
       <Divider flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />
 
-      <Stack spacing={1.5}>
+      <Box sx={sectionSx("run")}>
+        <Stack spacing={1.5}>
         <Typography variant="subtitle1">Threshold Controls</Typography>
         <Typography variant="caption" color="text.secondary">
           Adjust the sliders to explore different channel cutoffs. Charts and previews update instantly.
@@ -1295,11 +1223,13 @@ export default function LeftPanel() {
             )}
           </Stack>
         </Stack>
-      </Stack>
+        </Stack>
+      </Box>
 
       <Divider flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />
 
-      <Stack spacing={1.5}>
+      <Box sx={sectionSx("load")}>
+        <Stack spacing={1.5}>
         <Typography variant="subtitle1">Visualization Settings</Typography>
         <Typography variant="caption" color="text.secondary">
           Tune the figure aesthetics before exporting charts.
@@ -1424,11 +1354,13 @@ export default function LeftPanel() {
             </Stack>
           ))}
         </Stack>
-      </Stack>
+        </Stack>
+      </Box>
 
       <Divider flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />
 
-      <Stack spacing={1.5}>
+      <Box sx={sectionSx("run")}>
+        <Stack spacing={1.5}>
         <Stack spacing={0.5}>
           <Stack direction="row" spacing={1}>
             <TextField
@@ -1469,14 +1401,16 @@ export default function LeftPanel() {
             onClick={async () => {
               try {
                 const response = await configReadMutation.mutateAsync({ path: configPath });
-                setGroupMap(response.groups);
+                const normalizedGroups = normalizeGroupMapping(response.groups);
+                setGroupMap(normalizedGroups);
+                setGroupsJson(JSON.stringify(normalizedGroups, null, 2));
                 setSubjectInputs({});
                 setPixelSize(response.pixel_size_um ? String(response.pixel_size_um) : "");
-                 if (response.ratios && response.ratios.length > 0) {
-                   setRatioDrafts(response.ratios);
-                 } else {
-                   setRatioDrafts(DEFAULT_RATIO_DEFINITIONS);
-                 }
+                if (response.ratios && response.ratios.length > 0) {
+                  setRatioDrafts(response.ratios);
+                } else {
+                  setRatioDrafts(DEFAULT_RATIO_DEFINITIONS);
+                }
                 setConfigError(null);
               } catch (error) {
                 setConfigError(getErrorMessage(error));
@@ -1526,11 +1460,14 @@ export default function LeftPanel() {
         )}
         {runMutation.isError && <Alert severity="error">{getErrorMessage(runMutation.error)}</Alert>}
         {configReadMutation.isError && <Alert severity="error">{getErrorMessage(configReadMutation.error)}</Alert>}
-      </Stack>
+        </Stack>
+      </Box>
 
       <Divider flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />
 
-      <Stack spacing={1.5}>
+      <Box sx={sectionSx("load")}>
+      <Box sx={sectionSx("load")}>
+        <Stack spacing={1.5}>
         <Stack spacing={0.5}>
           <Stack direction="row" spacing={1}>
             <TextField
@@ -1689,7 +1626,11 @@ export default function LeftPanel() {
             )}
           </Stack>
         )}
-      </Stack>
+        </Stack>
+      </Box>
+
+
+      </Box>
 
       <Divider flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />
     </Stack>

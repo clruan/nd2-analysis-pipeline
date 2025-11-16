@@ -39,31 +39,15 @@ def find_nd2_files(input_dir: Path, recursive: bool = True) -> List[Path]:
     return sorted(input_dir.glob(pattern))
 
 
-SUBJECT_PATTERN = re.compile(r"([A-Za-z]+\d{1,4})")
-
-
-def _subject_rank(token: str, index: int) -> tuple:
-    digits = re.search(r"\d+", token)
-    digit_length = len(digits.group(0)) if digits else 0
-    return (digit_length, len(token), index)
+SUBJECT_PATTERN = re.compile(r"^[A-Za-z]+\d{1,4}$")
 
 
 def guess_subject_id(filename_stem: str) -> str:
     tokens = re.split(r"[\s_\-]+", filename_stem)
-    candidates = []
-    for index, token in enumerate(tokens):
-        if SUBJECT_PATTERN.fullmatch(token):
-            candidates.append((token, _subject_rank(token, index)))
-    if candidates:
-        return max(candidates, key=lambda item: item[1])[0]
-
-    matches = list(SUBJECT_PATTERN.finditer(filename_stem))
-    if matches:
-        ranked = max(
-            matches,
-            key=lambda match: _subject_rank(match.group(1), filename_stem.find(match.group(1)))
-        )
-        return ranked.group(1)
+    for token in tokens:
+        candidate = token.strip()
+        if candidate and SUBJECT_PATTERN.match(candidate):
+            return candidate
     return filename_stem
 
 

@@ -1,6 +1,7 @@
 """Core image processing functions for ND2 files."""
 
 import os
+import re
 import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, List, Optional, Union, Any
@@ -37,18 +38,34 @@ def get_nd2_files(directory: str) -> List[str]:
     logger.info(f"Found {len(nd2_files)} ND2 files in {directory}")
     return nd2_files
 
-def parse_mouse_id(filename: str, marker: str = DEFAULT_MARKER) -> str:
+def parse_mouse_id(filename: str, marker: str = DEFAULT_MARKER, mouse_ids: list = None) -> str:
     """
-    Extract mouse ID from filename based on marker position.
+    Extract mouse ID from filename using direct token matching.
     
     Args:
         filename: Path to the file
-        marker: String marker that precedes mouse ID
+        marker: String marker that precedes mouse ID (for backward compatibility)
+        mouse_ids: List of known mouse IDs to search for
         
     Returns:
         Extracted mouse ID
     """
-    parts = os.path.splitext(os.path.basename(filename))[0].split()
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+    parts = base_name.split()
+    
+    # If mouse_ids list is provided, use direct token matching
+    if mouse_ids:
+        sanitized_base = re.sub(r'[\W_]+', '', base_name).lower()
+        for candidate in mouse_ids:
+            candidate_clean = re.sub(r'[\W_]+', '', candidate).lower()
+            if candidate_clean and candidate_clean in sanitized_base:
+                return candidate
+        for part in parts:
+            if part in mouse_ids:
+                return part
+        raise ValueError(f"No known mouse ID found in filename: {filename}")
+    
+    # Fallback to original marker-based approach for backward compatibility
     try:
         marker_index = parts.index(marker)
         if marker_index == 0:
@@ -78,10 +95,10 @@ def load_nd2_file(filepath: str, is_3d: bool = True) -> Tuple[np.ndarray, np.nda
             image = np.asarray(nd2)
             logger.debug(f"Loaded 3D image: {filepath}, shape: {image.shape}")
             
-            # Max projections over z-axis
-            channel_1 = np.max(image[:, 0, :, :], axis=0)  # Channel 0 -> Channel 1
-            channel_2 = np.max(image[:, 1, :, :], axis=0)  # Channel 1 -> Channel 2
-            channel_3 = np.max(image[:, 2, :, :], axis=0)  # Channel 2 -> Channel 3
+            channel_arrays: List[np.ndarray] = []
+            channel_count = image.shape[1] if image.ndim >= 2 else 0
+            for idx in range(min(channel_count, 3)):
+                channel_arrays.append(np.max(image[:, idx, :, :], axis=0))
             
             nd2.close()
             
@@ -93,9 +110,28 @@ def load_nd2_file(filepath: str, is_3d: bool = True) -> Tuple[np.ndarray, np.nda
             
             logger.debug(f"Loaded 2D image: {filepath}, shape: {image.shape}")
             
-            channel_1 = image[0]
-            channel_2 = image[1]
-            channel_3 = image[2]
+            channel_arrays = []
+            if image.ndim >= 3:
+                channel_axis = 0
+                channel_count = image.shape[channel_axis]
+                for idx in range(min(channel_count, 3)):
+                    channel_arrays.append(image[idx])
+            else:
+                raise ValueError(f"Unexpected ND2 image shape for 2D data: {image.shape}")
+
+        actual_channels = len(channel_arrays)
+        if actual_channels == 0:
+            raise ValueError(f"No channels found in ND2 file: {filepath}")
+
+        reference = channel_arrays[0]
+        while len(channel_arrays) < 3:
+            channel_arrays.append(np.zeros_like(reference))
+        if actual_channels < 3:
+            logger.warning(
+                f"Padded ND2 file {os.path.basename(filepath)} from {actual_channels} to 3 channels with zeros"
+            )
+
+        channel_1, channel_2, channel_3 = channel_arrays[:3]
             
         return channel_1, channel_2, channel_3
         
@@ -230,8 +266,10 @@ def process_single_file(
         # Extract mouse ID and lookup group
         if marker is None:
             marker = DEFAULT_MARKER if is_3d else DEFAULT_MARKER_2D
-            
-        mouse_id = parse_mouse_id(filepath, marker)
+        
+        # Extract known mouse IDs from mouse_lookup for direct matching
+        known_mouse_ids = list(mouse_lookup.keys())
+        mouse_id = parse_mouse_id(filepath, marker, known_mouse_ids)
         
         if mouse_id not in mouse_lookup:
             logger.warning(f"Mouse ID {mouse_id} not found in groups")
