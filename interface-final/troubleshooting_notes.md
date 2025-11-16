@@ -69,6 +69,10 @@ This log captures the issues uncovered during the most recent debugging session 
   Attempted to solve long x-axis labels by wrapping charts in a horizontal scroller. Users preferred Plotly’s native zoom/pan so the change was reverted and replaced with scroll-wheel zoom plus pan/zoom buttons.
 - **Subject ID heuristics**  
   `guess_subject_id` returned the first alphanumeric token in a filename (e.g., `A1_A17_rep1` → `A1`), causing downstream grouping errors where `A17` appeared under `A1`. The helper now ranks all matches by digit length and position, picking the most specific token.
+- **Config builder drift**  
+  Loading an existing config did not refresh the editable JSON/Group Builder view, so manual corrections from earlier sessions were lost. The loader now normalizes the config map, updates the JSON textarea, and rerenders the builder so hand-curated groups stay in sync.
+- **Excel export dependency gaps**  
+  Downloading the Excel workbook failed with a 500 when `openpyxl`/`xlsxwriter` were missing. The API now declares both dependencies and falls back gracefully with a clear error if neither writer is available.
 
 ---
 

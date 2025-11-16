@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict, Counter
 import json
 from datetime import datetime, timedelta
+import re
 from pathlib import Path
 from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple, Set
 
@@ -48,6 +49,141 @@ CHANNEL_METRICS: Tuple[Dict[str, object], ...] = (
     {"id": "channel_3_area", "label": "Channel 3 Area (%)", "kind": "channel", "channel": 3},
 )
 
+SUBJECT_TOKEN_PATTERN = re.compile(r"([A-Za-z]+)(\d{1,4})")
+
+
+def _canonical_subject_id(value: str) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", "", str(value)).upper()
+
+
+def _loose_subject_id(value: str) -> str:
+    match = re.match(r"^([A-Z]+)(\d+)$", value)
+    if not match:
+        return value
+    prefix, digits = match.groups()
+    stripped = digits.lstrip("0") or "0"
+    return f"{prefix}{stripped}"
+
+
+class _SubjectLookup(NamedTuple):
+    group_exact: Dict[str, Dict[str, str]]
+    group_loose: Dict[str, Dict[str, str]]
+    global_exact: Dict[str, str]
+    global_loose: Dict[str, str]
+    owners: Dict[str, str]
+    loose_owners: Dict[str, str]
+
+
+def _build_subject_lookup(group_info: Dict[str, Iterable[str]]) -> _SubjectLookup:
+    group_exact: Dict[str, Dict[str, str]] = {}
+    group_loose: Dict[str, Dict[str, str]] = {}
+    global_exact: Dict[str, str] = {}
+    global_loose: Dict[str, str] = {}
+    owners: Dict[str, str] = {}
+    loose_owners: Dict[str, str] = {}
+    loose_conflicts: Set[str] = set()
+
+    for group, subjects in group_info.items():
+        exact_map: Dict[str, str] = {}
+        loose_map: Dict[str, str] = {}
+        for subject in subjects or []:
+            canonical = _canonical_subject_id(subject)
+            if not canonical:
+                continue
+            exact_map.setdefault(canonical, str(subject))
+            if canonical not in global_exact:
+                global_exact[canonical] = str(subject)
+                owners[canonical] = group
+
+            loose = _loose_subject_id(canonical)
+            if loose and loose not in loose_map:
+                loose_map[loose] = str(subject)
+
+            if loose:
+                if loose in loose_conflicts:
+                    continue
+                if loose in global_loose and global_loose[loose] != str(subject):
+                    loose_conflicts.add(loose)
+                    global_loose.pop(loose, None)
+                    loose_owners.pop(loose, None)
+                elif loose not in global_loose:
+                    global_loose[loose] = str(subject)
+                    loose_owners[loose] = group
+        group_exact[group] = exact_map
+        group_loose[group] = loose_map
+
+    return _SubjectLookup(
+        group_exact=group_exact,
+        group_loose=group_loose,
+        global_exact=global_exact,
+        global_loose=global_loose,
+        owners=owners,
+        loose_owners=loose_owners,
+    )
+
+
+def _match_subject_from_filename(
+    filename: str,
+    lookups: _SubjectLookup,
+    group: str,
+) -> Optional[Tuple[str, str]]:
+    best: Optional[Tuple[int, int, str, str]] = None
+    exact_group = lookups.group_exact.get(group, {})
+    loose_group = lookups.group_loose.get(group, {})
+    for match in SUBJECT_TOKEN_PATTERN.finditer(filename):
+        token = _canonical_subject_id(match.group(0))
+        loose = _loose_subject_id(token)
+        for key, source, owners in (
+            (token, exact_group, lookups.owners),
+            (token, lookups.global_exact, lookups.owners),
+            (loose, loose_group, lookups.loose_owners),
+            (loose, lookups.global_loose, lookups.loose_owners),
+        ):
+            if not key:
+                continue
+            candidate = source.get(key)
+            if not candidate:
+                continue
+            owner_group = owners.get(key, group)
+            digit_count = len(match.group(2))
+            position = match.start()
+            if best is None or digit_count > best[0] or (digit_count == best[0] and position < best[1]):
+                best = (digit_count, position, candidate, owner_group)
+    if best:
+        return best[2], best[3]
+    return None
+
+
+def _retokenize_mouse_ids(results: ThresholdResults) -> None:
+    if not results.group_info:
+        return
+    lookup = _build_subject_lookup(results.group_info)
+    for entry in results.image_data:
+        matched = _match_subject_from_filename(entry.filename, lookup, entry.group)
+        if matched:
+            subject_id, owner_group = matched
+            entry.mouse_id = subject_id
+            entry.group = owner_group
+            continue
+
+        canonical = _canonical_subject_id(entry.mouse_id)
+        if not canonical:
+            continue
+        if canonical in lookup.global_exact:
+            entry.mouse_id = lookup.global_exact[canonical]
+            owner = lookup.owners.get(canonical)
+            if owner:
+                entry.group = owner
+            continue
+        loose = _loose_subject_id(canonical)
+        if loose and loose in lookup.global_loose:
+            entry.mouse_id = lookup.global_loose[loose]
+            owner = lookup.loose_owners.get(loose)
+            if owner:
+                entry.group = owner
+
 
 def load_study(request: LoadStudyRequest) -> StudyRecord:
     path = normalize_path(request.file_path).resolve()
@@ -85,6 +221,9 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
             status_code=422,
             detail="Threshold results contain no image data. Please rerun threshold generation for this study.",
         )
+
+    _retokenize_mouse_ids(results)
+
     study_id = slugify(results.study_name)
     run_lookup = next(
         (
@@ -1101,7 +1240,13 @@ def generate_downloads(study_id: str, thresholds: Dict[str, int]) -> DownloadRes
         except Exception:
             excel_engine = None
 
-    writer_factory = pd.ExcelWriter(excel_path, engine=excel_engine) if excel_engine else pd.ExcelWriter(excel_path)
+    try:
+        writer_factory = pd.ExcelWriter(excel_path, engine=excel_engine) if excel_engine else pd.ExcelWriter(excel_path)
+    except ValueError as exc:  # pragma: no cover - optional dependency
+        raise HTTPException(
+            status_code=500,
+            detail="Excel export requires openpyxl or xlsxwriter. Install one of these packages and restart the API.",
+        ) from exc
 
     with writer_factory as writer:
         if not graphpad_df.empty:
