@@ -4,6 +4,9 @@ import type { LoadedStudy, RatioDefinition } from "../api/types";
 import { DEFAULT_RATIO_DEFINITIONS } from "../constants/metrics";
 
 type ThresholdMap = Record<string, number>;
+type ChannelId = "channel_1" | "channel_2" | "channel_3";
+type PanelId = "channel_1" | "channel_2" | "channel_3" | "composite";
+type ChannelRangeTuple = [number, number];
 
 type ComparisonMode = "all_vs_one" | "pairs" | "all_pairs";
 type TestType = "anova_parametric" | "anova_non_parametric" | "t_test";
@@ -36,6 +39,8 @@ interface AppState {
   previewSamplesPerGroup: number;
   ratioDefinitions: RatioDefinition[];
   previewGroupOverrides: Record<string, number>;
+  previewChannelRanges: Record<ChannelId, ChannelRangeTuple>;
+  previewPanelOrder: PanelId[];
   setStudy: (study: LoadedStudy | null) => void;
   setThreshold: (channel: string, value: number) => void;
   setThresholds: (values: ThresholdMap) => void;
@@ -56,9 +61,14 @@ interface AppState {
   setJitterEnabled: (enabled: boolean) => void;
   setJitterWidth: (width: number) => void;
   setPreviewSamplesPerGroup: (value: number) => void;
+  setPreviewChannelRange: (channel: ChannelId, range: ChannelRangeTuple) => void;
+  resetPreviewChannelRanges: () => void;
+  setPreviewPanelOrder: (order: PanelId[]) => void;
+  resetPreviewPanelOrder: () => void;
   setRatioDefinitions: (ratios: RatioDefinition[]) => void;
   setPreviewGroupOverride: (group: string, value: number | null) => void;
   resetPreviewGroupOverrides: () => void;
+  updateStudy: (update: Partial<LoadedStudy>) => void;
 }
 
 const defaultThresholds: ThresholdMap = {
@@ -68,6 +78,12 @@ const defaultThresholds: ThresholdMap = {
 };
 
 const defaultSelectedMetric = "channel_1_area";
+const createDefaultChannelRanges = (): Record<ChannelId, ChannelRangeTuple> => ({
+  channel_1: [100, 2200],
+  channel_2: [150, 2200],
+  channel_3: [50, 2200]
+});
+const defaultPanelOrder: PanelId[] = ["channel_1", "channel_2", "channel_3", "composite"];
 
 const createDefaultStatisticsSettings = (): StatisticsSettings => ({
   comparisonMode: "all_vs_one",
@@ -104,6 +120,8 @@ export const useAppStore = create<AppState>()(
     previewSamplesPerGroup: 1,
     ratioDefinitions: DEFAULT_RATIO_DEFINITIONS,
     previewGroupOverrides: {},
+    previewChannelRanges: createDefaultChannelRanges(),
+    previewPanelOrder: [...defaultPanelOrder],
     setStudy: (study) =>
       set(() => ({
         study,
@@ -113,7 +131,9 @@ export const useAppStore = create<AppState>()(
         plotSettings: defaultPlotSettings(),
         previewSamplesPerGroup: 1,
         ratioDefinitions: study?.ratio_definitions ?? DEFAULT_RATIO_DEFINITIONS,
-        previewGroupOverrides: {}
+        previewGroupOverrides: {},
+        previewChannelRanges: createDefaultChannelRanges(),
+        previewPanelOrder: [...defaultPanelOrder]
       })),
     setThreshold: (channel, value) =>
       set((state) => ({ thresholds: { ...state.thresholds, [channel]: value } })),
@@ -246,6 +266,38 @@ export const useAppStore = create<AppState>()(
       set(() => ({
         previewSamplesPerGroup: Math.max(1, Math.min(6, Math.round(value)))
       })),
+    setPreviewChannelRange: (channel, range) =>
+      set((state) => {
+        const [rawMin, rawMax] = range;
+        const min = Math.max(0, Math.min(4095, Math.min(rawMin, rawMax)));
+        const max = Math.max(0, Math.min(4095, Math.max(rawMin, rawMax)));
+        const adjusted: ChannelRangeTuple = min === max ? [min, min + 1] : [min, max];
+        return {
+          previewChannelRanges: {
+            ...state.previewChannelRanges,
+            [channel]: adjusted
+          }
+        };
+      }),
+    resetPreviewChannelRanges: () =>
+      set(() => ({
+        previewChannelRanges: createDefaultChannelRanges()
+      })),
+    setPreviewPanelOrder: (order) =>
+      set(() => {
+        const normalized = (order ?? []).filter(
+          (panel, index, array): panel is PanelId =>
+            ["channel_1", "channel_2", "channel_3", "composite"].includes(panel) &&
+            array.indexOf(panel) === index
+        );
+        return {
+          previewPanelOrder: normalized.length ? normalized : [...defaultPanelOrder]
+        };
+      }),
+    resetPreviewPanelOrder: () =>
+      set(() => ({
+        previewPanelOrder: [...defaultPanelOrder]
+      })),
     setRatioDefinitions: (ratios) =>
       set(() => ({
         ratioDefinitions: ratios.length ? ratios : DEFAULT_RATIO_DEFINITIONS
@@ -263,6 +315,10 @@ export const useAppStore = create<AppState>()(
     resetPreviewGroupOverrides: () =>
       set(() => ({
         previewGroupOverrides: {}
+      })),
+    updateStudy: (update) =>
+      set((state) => ({
+        study: state.study ? { ...state.study, ...update } : state.study
       }))
   }))
 );

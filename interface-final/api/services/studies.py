@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 from collections import defaultdict, Counter
+import hashlib
 import json
 from datetime import datetime, timedelta
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple, Set
+import zipfile
+import logging
 
 import numpy as np
 import pandas as pd
 from fastapi import HTTPException
+import matplotlib.pyplot as plt
 import shutil
 from PIL import Image
 
 from threshold_analysis.batch_processor import load_threshold_results
 from threshold_analysis.data_models import ThresholdData, ThresholdResults
 
-from data_models import GroupConfig
+from data_models import GroupConfig, VisualizationConfig
 
 from ..schemas import (
     AnalyzeRequest,
@@ -33,15 +37,22 @@ from ..schemas import (
     StatisticsRequest,
     StatisticsResponse,
     DownloadResponse,
+    PixelSizeUpdateRequest,
+    PixelSizeUpdateResponse,
+    PreviewDownloadRequest,
+    PreviewDownloadResponse,
 )
 from ..state import STATE, StudyRecord
 from ..utils import ensure_directory, find_nd2_files, normalize_path, preview_plane_filename, slugify
 from .ratios import DEFAULT_RATIO_DEFINITIONS, normalize_ratio_definitions
-from image_processing import load_nd2_file
+from image_processing import load_nd2_file, detect_pixel_size
+from visualization import ND2Visualizer
 
 
 DOWNLOAD_ROOT = ensure_directory(Path(__file__).resolve().parent / "generated_downloads")
 PREVIEW_ROOT = ensure_directory(Path(__file__).resolve().parent / "generated_previews")
+
+LOGGER = logging.getLogger(__name__)
 
 CHANNEL_METRICS: Tuple[Dict[str, object], ...] = (
     {"id": "channel_1_area", "label": "Channel 1 Area (%)", "kind": "channel", "channel": 1},
@@ -239,6 +250,7 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
     is_3d: bool = True
     preview_plane_root: Optional[Path] = None
     ratio_definitions: Optional[List[Dict[str, object]]] = None
+    pixel_size_um: Optional[float] = None
 
     meta: Dict[str, object] = {}
     meta_path = Path(str(path) + ".meta.json")
@@ -247,6 +259,12 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
             meta = json.loads(meta_path.read_text())
         except Exception:
             meta = {}
+    meta_pixel = meta.get("pixel_size_um")
+    if meta_pixel is not None:
+        try:
+            pixel_size_um = float(meta_pixel)
+        except (TypeError, ValueError):
+            pixel_size_um = None
 
     override_dir: Optional[Path] = None
     if request.input_dir_override:
@@ -269,6 +287,9 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
         ratio_definitions = run_lookup.ratio_definitions
     elif meta.get("ratio_definitions"):
         ratio_definitions = meta.get("ratio_definitions")
+
+    if run_lookup and run_lookup.pixel_size_um:
+        pixel_size_um = run_lookup.pixel_size_um
 
     if override_dir:
         input_dir = override_dir
@@ -310,10 +331,14 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
         try:
             group_config = GroupConfig.from_json(str(config_candidate))
             ratio_definitions = group_config.ratios
+            if pixel_size_um is None and group_config.pixel_size_um:
+                pixel_size_um = group_config.pixel_size_um
         except Exception:
             ratio_definitions = None
 
     ratio_definitions = normalize_ratio_definitions(ratio_definitions)
+    if pixel_size_um is None and input_dir:
+        pixel_size_um = _detect_pixel_size_from_dir(input_dir)
     replicate_lookup = _build_replicate_lookup(results, input_dir)
 
     record = StudyRecord(
@@ -325,6 +350,7 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
         is_3d=is_3d,
         preview_plane_root=preview_plane_root,
         ratio_definitions=ratio_definitions,
+        pixel_size_um=pixel_size_um,
     )
     STATE.add_study(record)
     return record
@@ -352,6 +378,18 @@ def _build_replicate_lookup(results: ThresholdResults, input_dir: Path) -> Dict[
             )
             subject_map[entry.filename] = chosen
     return lookup
+
+
+def _detect_pixel_size_from_dir(input_dir: Path) -> Optional[float]:
+    try:
+        nd2_files = find_nd2_files(input_dir)
+    except Exception:
+        return None
+    for path in nd2_files:
+        detected = detect_pixel_size(str(path))
+        if detected:
+            return detected
+    return None
 
 
 def _metric_definitions(record: StudyRecord) -> List[Dict[str, object]]:
@@ -724,6 +762,7 @@ ALL_PREVIEW_METRICS: Tuple[str, ...] = (
 )
 
 DEFAULT_PREVIEW_METRIC = ALL_PREVIEW_METRICS[0]
+DEFAULT_PANEL_ORDER: Tuple[str, ...] = ("channel_1", "channel_2", "channel_3", "composite")
 
 GRAPH_PAD_EXPORT_ORDER: Tuple[Tuple[str, str], ...] = (
     ("Channel_1_area", "Channel 1"),
@@ -785,22 +824,97 @@ def _preview_variants_for_metric(metric: Dict[str, object]) -> List[PreviewVaria
     ]
 
 
+def _sanitize_panel_order(order: Optional[Iterable[str]]) -> List[str]:
+    if not order:
+        return list(DEFAULT_PANEL_ORDER)
+    normalized: List[str] = []
+    for panel in order:
+        if panel in DEFAULT_PANEL_ORDER and panel not in normalized:
+            normalized.append(panel)
+    return normalized or list(DEFAULT_PANEL_ORDER)
+
+def _normalize_channel_ranges(payload: Optional[Dict[str, object]]) -> Dict[int, Tuple[float, float]]:
+    """Convert client-provided channel range payload into numeric overrides."""
+    if not payload:
+        return {}
+    normalized: Dict[int, Tuple[float, float]] = {}
+
+    def _extract_bounds(candidate: object) -> Optional[Tuple[float, float]]:
+        # Accept plain dicts, pydantic models, or lightweight objects with vmin/vmax attributes.
+        raw_min = None
+        raw_max = None
+        if isinstance(candidate, dict):
+            raw_min = candidate.get("vmin")
+            raw_max = candidate.get("vmax")
+        else:
+            raw_min = getattr(candidate, "vmin", None)
+            raw_max = getattr(candidate, "vmax", None)
+            if raw_min is None and hasattr(candidate, "model_dump"):
+                try:
+                    data = candidate.model_dump()
+                except Exception:
+                    data = {}
+                raw_min = data.get("vmin", raw_min)
+                raw_max = data.get("vmax", raw_max)
+
+        if raw_min is None and raw_max is None:
+            return None
+
+        vmin = float(raw_min if raw_min is not None else 0)
+        vmax = float(raw_max if raw_max is not None else vmin + 1)
+        if vmax <= vmin:
+            vmax = vmin + 1
+        return max(0.0, vmin), max(vmax, vmin + 1e-3)
+
+    for key, values in payload.items():
+        channel_match = re.match(r"channel_(\d+)", key)
+        if not channel_match:
+            continue
+        bounds = _extract_bounds(values)
+        if bounds is None:
+            continue
+        channel_index = int(channel_match.group(1))
+        normalized[channel_index] = bounds
+    return normalized
+
+
+def _channel_range_token(channel_ranges: Dict[int, Tuple[float, float]]) -> str:
+    if not channel_ranges:
+        return "default"
+    parts = []
+    for channel_index in sorted(channel_ranges):
+        vmin, vmax = channel_ranges[channel_index]
+        parts.append(f"{channel_index}:{int(vmin)}-{int(vmax)}")
+    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:10]
+    return f"rng-{digest}"
+
+
+def _visualizer_range_payload(channel_ranges: Dict[int, Tuple[float, float]]) -> Dict[str, Dict[str, float]]:
+    payload: Dict[str, Dict[str, float]] = {}
+    for channel_index, (vmin, vmax) in channel_ranges.items():
+        payload[f"channel_{channel_index}"] = {"vmin": vmin, "vmax": vmax}
+    return payload
+
+
 def _build_variant_cache_key(
-    cache_base: str, variant: PreviewVariant, threshold_key: str, metric: str
+    cache_base: str, variant: PreviewVariant, threshold_key: str, metric: str, range_token: str
 ) -> str:
     channel_tag = "-".join(str(ch) for ch in variant.channels) or "all"
+    token = range_token or "default"
     if variant.cacheable:
-        return f"{cache_base}|{variant.variant}|{channel_tag}"
-    return f"{cache_base}|{threshold_key}|{metric}|{variant.variant}|{channel_tag}"
+        return f"{cache_base}|{variant.variant}|{channel_tag}|{token}"
+    return f"{cache_base}|{threshold_key}|{metric}|{variant.variant}|{channel_tag}|{token}"
 
 
 def _build_variant_filename(
-    safe_base: str, variant: PreviewVariant, metric_slug: str, cacheable: bool
+    safe_base: str, variant: PreviewVariant, metric_slug: str, cacheable: bool, range_token: str
 ) -> str:
     channel_tag = "-".join(f"ch{ch}" for ch in variant.channels) or "all"
     parts = [safe_base, variant.variant, channel_tag]
     if not cacheable:
         parts.append(metric_slug)
+    if range_token and range_token != "default":
+        parts.append(range_token)
     return "_".join(parts) + ".png"
 
 
@@ -818,12 +932,13 @@ def _metadata_path_for(image_path: Path) -> Path:
     return Path(str(image_path) + ".meta.json")
 
 
-def _write_preview_metadata(image_path: Path, metric_id: str, variant: PreviewVariant) -> None:
+def _write_preview_metadata(image_path: Path, metric_id: str, variant: PreviewVariant, range_token: str) -> None:
     metadata = {
         "variant": variant.variant,
         "channels": list(variant.channels),
         "cache_scope": "global" if variant.cacheable else metric_id,
         "updated_at": datetime.utcnow().isoformat() + "Z",
+        "range_token": range_token or "default",
     }
     meta_path = _metadata_path_for(image_path)
     try:
@@ -834,7 +949,7 @@ def _write_preview_metadata(image_path: Path, metric_id: str, variant: PreviewVa
             meta_path.unlink(missing_ok=True)
 
 
-def _metadata_matches(image_path: Path, metric_id: str, variant: PreviewVariant) -> bool:
+def _metadata_matches(image_path: Path, metric_id: str, variant: PreviewVariant, range_token: str) -> bool:
     meta_path = _metadata_path_for(image_path)
     if not meta_path.exists():
         return False
@@ -847,14 +962,17 @@ def _metadata_matches(image_path: Path, metric_id: str, variant: PreviewVariant)
         return False
     if data.get("channels") != list(variant.channels):
         return False
-    return data.get("cache_scope") == expected_scope
+    if data.get("cache_scope") != expected_scope:
+        return False
+    stored_token = data.get("range_token", "default")
+    return stored_token == (range_token or "default")
 
 
-def _cached_variant_valid(path: Path, metric_id: str, variant: PreviewVariant) -> bool:
+def _cached_variant_valid(path: Path, metric_id: str, variant: PreviewVariant, range_token: str) -> bool:
     path = Path(path)
     if not _is_valid_preview_file(path):
         return False
-    return _metadata_matches(path, metric_id, variant)
+    return _metadata_matches(path, metric_id, variant, range_token)
 
 
 def _prune_preview_thresholds(preview_dir: Path, retain_keys: Set[str], max_sets: int = 5, max_age_days: int = 7) -> None:
@@ -954,7 +1072,10 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
     variant_plans = {metric_id: _preview_variants_for_metric(metric_map[metric_id]) for metric_id in metric_ids}
 
     groups_requested = set(request.groups) if request.groups else None
+    channel_ranges = _normalize_channel_ranges(request.channel_ranges)
+    range_token = _channel_range_token(channel_ranges)
     group_counts: Dict[str, int] = defaultdict(int)
+    group_subjects: Dict[str, Set[str]] = defaultdict(set)
     per_group_limits: Dict[str, int] = {
         group: max(1, min(6, int(value)))
         for group, value in (request.group_sample_limits or {}).items()
@@ -968,7 +1089,10 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
         if groups_requested and entry.group not in groups_requested:
             continue
         limit = per_group_limits.get(entry.group, max_samples)
-        if group_counts[entry.group] >= limit:
+        subjects_seen = group_subjects[entry.group]
+        if entry.mouse_id in subjects_seen:
+            continue
+        if len(subjects_seen) >= limit:
             continue
 
         cache_base = f"{entry.group}|{entry.mouse_id}|{entry.filename}"
@@ -982,34 +1106,42 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
             existing_files: Dict[str, Path] = {}
 
             for variant in variant_plan:
-                cache_key = _build_variant_cache_key(cache_base, variant, threshold_key, metric_id)
-                output_dir = raw_dir if variant.cacheable else metric_dir
-                safe_name = _build_variant_filename(safe_base, variant, metric_slug, variant.cacheable)
+                cacheable_variant = variant.cacheable and not channel_ranges
+                cache_key = _build_variant_cache_key(cache_base, variant, threshold_key, metric_id, range_token)
+                output_dir = raw_dir if cacheable_variant else metric_dir
+                safe_name = _build_variant_filename(safe_base, variant, metric_slug, cacheable_variant, range_token)
                 image_path = output_dir / safe_name
 
-                cached_path = record.preview_cache.get(cache_key) if variant.cacheable else None
-                if cached_path and _cached_variant_valid(cached_path, metric_id, variant):
+                cached_path = record.preview_cache.get(cache_key) if cacheable_variant else None
+                if cacheable_variant and cached_path and _cached_variant_valid(cached_path, metric_id, variant, range_token):
                     existing_files[cache_key] = cached_path
                     continue
 
-                if _cached_variant_valid(image_path, metric_id, variant):
-                    existing_files[cache_key] = image_path
-                    if variant.cacheable:
+                if cacheable_variant is False:
+                    # Non-cacheable variants (mask/overlay) must refresh whenever the LUT changes.
+                    if _cached_variant_valid(image_path, metric_id, variant, range_token) and range_token == "default":
+                        existing_files[cache_key] = image_path
+                        continue
+                else:
+                    if _cached_variant_valid(image_path, metric_id, variant, range_token):
+                        existing_files[cache_key] = image_path
                         record.preview_cache[cache_key] = image_path
-                    continue
+                        continue
 
                 if channel_arrays is None:
-                    channel_arrays = _load_channels(record, entry.group, entry.mouse_id, entry.filename)
+                    channel_arrays = _load_channels(
+                        record, entry.group, entry.mouse_id, entry.filename, allow_png_fallback=False
+                    )
                 if not channel_arrays:
                     continue
 
-                image_array = _render_preview_variant(channel_arrays, thresholds, variant)
+                image_array = _render_preview_variant(channel_arrays, thresholds, variant, channel_ranges)
                 if image_array is None:
                     continue
 
                 _write_image(image_array, image_path)
-                _write_preview_metadata(image_path, metric_id, variant)
-                if variant.cacheable:
+                _write_preview_metadata(image_path, metric_id, variant, range_token)
+                if cacheable_variant:
                     record.preview_cache[cache_key] = image_path
                 existing_files[cache_key] = image_path
 
@@ -1017,7 +1149,7 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
                 continue
 
             for variant in variant_plan:
-                cache_key = _build_variant_cache_key(cache_base, variant, threshold_key, metric_id)
+                cache_key = _build_variant_cache_key(cache_base, variant, threshold_key, metric_id, range_token)
                 image_path = existing_files.get(cache_key)
                 if not image_path:
                     continue
@@ -1034,7 +1166,8 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
                     )
                 )
 
-        group_counts[entry.group] += 1
+        group_subjects[entry.group].add(entry.mouse_id)
+        group_counts[entry.group] = len(group_subjects[entry.group])
 
     metric_rank = {metric["id"]: index for index, metric in enumerate(metric_defs)}
     preview_images.sort(
@@ -1061,6 +1194,61 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
     )
 
 
+def render_preview_panel(study_id: str, request: PreviewDownloadRequest) -> PreviewDownloadResponse:
+    record = _get_record(study_id)
+    thresholds = _threshold_dict(request.thresholds)
+    panel_order = _sanitize_panel_order(request.panel_order)
+    channel_ranges = _normalize_channel_ranges(request.channel_ranges)
+    visualizer_ranges = _visualizer_range_payload(channel_ranges)
+
+    channel_arrays = _load_channels(
+        record,
+        request.group,
+        request.subject_id,
+        request.filename,
+        allow_png_fallback=False,
+    )
+    if not channel_arrays:
+        raise HTTPException(status_code=404, detail="ND2 data unavailable for the requested preview.")
+
+    def _project(channel_id: int) -> Optional[np.ndarray]:
+        array = channel_arrays.get(channel_id)
+        if array is None:
+            return None
+        if array.ndim == 2:
+            return array
+        return np.max(array, axis=0)
+
+    channel_1 = _project(1)
+    channel_2 = _project(2)
+    channel_3 = _project(3)
+    if channel_1 is None or channel_2 is None or channel_3 is None:
+        raise HTTPException(status_code=422, detail="One or more channels are missing for this preview.")
+
+    panel_dir = ensure_directory(PREVIEW_ROOT / study_id / "custom_panels")
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    file_name = f"{slugify(request.group)}_{slugify(request.subject_id)}_{timestamp}.png"
+    target_path = panel_dir / file_name
+
+    vis_config = VisualizationConfig(scale_bar_um=request.scale_bar_um or 50)
+    visualizer = ND2Visualizer(vis_config, pixel_size_um=record.pixel_size_um)
+    figure = visualizer.visualize_channels(
+        channel_1,
+        channel_2,
+        channel_3,
+        save_path=str(target_path),
+        add_scale_bar=True,
+        panel_order=panel_order,
+        channel_ranges=visualizer_ranges,
+    )
+    plt.close(figure)
+
+    return PreviewDownloadResponse(
+        image_path=str(target_path),
+        panel_order=panel_order,
+    )
+
+
 def list_ratio_definitions(study_id: str) -> List[Dict[str, object]]:
     record = _get_record(study_id)
     return record.ratio_definitions
@@ -1075,6 +1263,15 @@ def update_ratio_definitions(study_id: str, ratios: List[Dict[str, object]]) -> 
     return normalized
 
 
+def update_pixel_size(study_id: str, pixel_size_um: Optional[float]) -> Optional[float]:
+    record = _get_record(study_id)
+    if pixel_size_um is not None and pixel_size_um <= 0:
+        raise HTTPException(status_code=400, detail="Pixel size must be positive.")
+    record.pixel_size_um = float(pixel_size_um) if pixel_size_um else None
+    _persist_pixel_metadata(record)
+    return record.pixel_size_um
+
+
 def _persist_ratio_metadata(record: StudyRecord) -> None:
     meta_path = Path(str(record.source_path) + ".meta.json")
     try:
@@ -1083,6 +1280,24 @@ def _persist_ratio_metadata(record: StudyRecord) -> None:
         else:
             payload = {}
         payload["ratio_definitions"] = record.ratio_definitions
+        if record.input_dir:
+            payload.setdefault("input_dir", str(record.input_dir))
+        if record.preview_plane_root:
+            payload.setdefault("preview_root", str(record.preview_plane_root))
+        with meta_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+    except Exception:
+        pass
+
+
+def _persist_pixel_metadata(record: StudyRecord) -> None:
+    meta_path = Path(str(record.source_path) + ".meta.json")
+    try:
+        if meta_path.exists():
+            payload = json.loads(meta_path.read_text())
+        else:
+            payload = {}
+        payload["pixel_size_um"] = record.pixel_size_um
         if record.input_dir:
             payload.setdefault("input_dir", str(record.input_dir))
         if record.preview_plane_root:
@@ -1175,6 +1390,15 @@ def _format_replicates_dataframe(individual_df: pd.DataFrame, ratios: List[Dict[
         "channel_1_3_ratio": "Channel 1 / Channel 3",
         "channel_2_3_ratio": "Channel 2 / Channel 3",
     }
+    ratio_labels: List[str] = []
+    for ratio in ratios:
+        ratio_id = ratio.get("id")
+        if not ratio_id:
+            continue
+        label = ratio.get("label") or ratio_id
+        rename_map[ratio_id] = label
+        ratio_labels.append(label)
+
     table.rename(columns=rename_map, inplace=True)
     ordered_columns = [
         "Group",
@@ -1185,23 +1409,19 @@ def _format_replicates_dataframe(individual_df: pd.DataFrame, ratios: List[Dict[
         "Channel 2 Area (%)",
         "Channel 3 Area (%)",
     ]
-    ratio_labels: List[str] = []
-    for ratio in ratios:
-        ratio_id = ratio["id"]
-        label = ratio["label"]
-        rename_map[ratio_id] = label
-        ratio_labels.append(label)
     ordered_columns.extend(ratio_labels)
     existing_columns = [column for column in ordered_columns if column in table.columns]
     table = table[existing_columns]
     metric_columns = [
         column
         for column in existing_columns
-        if column.startswith("Channel")
+        if column.startswith("Channel") or column in ratio_labels
     ]
     for column in metric_columns:
         table[column] = table[column].astype(float).round(4)
-    table.sort_values(["Group", "Mouse ID", "Replicate #"], inplace=True, kind="mergesort")
+    sort_columns = [column for column in ("Group", "Mouse ID", "Replicate #") if column in table.columns]
+    if sort_columns:
+        table.sort_values(sort_columns, inplace=True, kind="mergesort")
     table.reset_index(drop=True, inplace=True)
     return table
 
@@ -1226,7 +1446,23 @@ def generate_downloads(study_id: str, thresholds: Dict[str, int]) -> DownloadRes
     graphpad_df = _build_graphpad_dataframe(mouse_averages_df, record.ratio_definitions)
     replicates_df = _format_replicates_dataframe(individual_images, record.ratio_definitions)
 
-    # Prefer openpyxl for better formatting, but fall back gracefully if it is unavailable.
+    try:
+        _write_excel_workbook(excel_path, graphpad_df, mouse_averages_df, replicates_df)
+        final_path = excel_path
+    except HTTPException:
+        raise
+    except Exception as exc:
+        LOGGER.warning("Excel export failed (%s). Falling back to CSV bundle.", exc)
+        final_path = _write_csv_bundle(
+            download_dir, study_id, timestamp, graphpad_df, mouse_averages_df, replicates_df
+        )
+
+    return DownloadResponse(download_path=str(final_path), generated_at=datetime.utcnow())
+
+
+def _write_excel_workbook(
+    excel_path: Path, graphpad_df: pd.DataFrame, mouse_df: pd.DataFrame, replicates_df: pd.DataFrame
+) -> None:
     excel_engine: Optional[str]
     try:  # pragma: no cover - optional dependency
         import openpyxl  # type: ignore  # noqa: F401
@@ -1251,7 +1487,7 @@ def generate_downloads(study_id: str, thresholds: Dict[str, int]) -> DownloadRes
     with writer_factory as writer:
         if not graphpad_df.empty:
             graphpad_df.to_excel(writer, sheet_name="GraphPad Data", index_label="Row")
-        mouse_averages_df.to_excel(writer, sheet_name="Mouse Averages", index=False)
+        mouse_df.to_excel(writer, sheet_name="Mouse Averages", index=False)
         replicates_df.to_excel(writer, sheet_name="Replicates", index=False)
         if excel_engine == "openpyxl":
             replicates_sheet = writer.sheets.get("Replicates")
@@ -1261,7 +1497,22 @@ def generate_downloads(study_id: str, thresholds: Dict[str, int]) -> DownloadRes
                 except Exception:
                     pass
 
-    return DownloadResponse(download_path=str(excel_path), generated_at=datetime.utcnow())
+
+def _write_csv_bundle(
+    base_dir: Path,
+    study_id: str,
+    timestamp: str,
+    graphpad_df: pd.DataFrame,
+    mouse_df: pd.DataFrame,
+    replicates_df: pd.DataFrame,
+) -> Path:
+    zip_path = base_dir / f"{study_id}_thresholds_{timestamp}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        if not graphpad_df.empty:
+            archive.writestr("graphpad_data.csv", graphpad_df.to_csv(index=True))
+        archive.writestr("mouse_averages.csv", mouse_df.to_csv(index=False))
+        archive.writestr("replicates.csv", replicates_df.to_csv(index=False))
+    return zip_path
 
 
 def resolve_preview_path(study_id: str, file_path: str) -> Path:
@@ -1286,10 +1537,18 @@ def resolve_download_path(study_id: str, file_path: str) -> Path:
     return target
 
 
-def _load_channels(record: StudyRecord, group: str, subject_id: str, filename: str) -> Optional[Dict[int, np.ndarray]]:
+def _load_channels(
+    record: StudyRecord, group: str, subject_id: str, filename: str, *, allow_png_fallback: bool = True
+) -> Optional[Dict[int, np.ndarray]]:
     cache_key = f"{group}|{subject_id}|{filename}"
+    cached_source = record.raw_cache_source.get(cache_key)
     if cache_key in record.raw_cache:
-        return record.raw_cache[cache_key]
+        # When a LUT override is requested, refuse to reuse PNG-sourced cache (clipped to 8-bit).
+        if not allow_png_fallback and cached_source not in {"nd2", "planes"}:
+            record.raw_cache.pop(cache_key, None)
+            record.raw_cache_source.pop(cache_key, None)
+        else:
+            return record.raw_cache[cache_key]
 
     channel_arrays: Dict[int, np.ndarray] = {}
 
@@ -1321,15 +1580,20 @@ def _load_channels(record: StudyRecord, group: str, subject_id: str, filename: s
             except Exception:
                 channel_arrays = {}
 
-    if not channel_arrays:
+    source_tag = "nd2"
+    if not channel_arrays and allow_png_fallback:
         channel_arrays = _load_channels_from_cached_png(record, group, subject_id, filename)
         if channel_arrays:
             _persist_preview_planes(record, group, subject_id, filename, channel_arrays)
+            source_tag = "png"
+    elif channel_arrays:
+        source_tag = "planes" if record.preview_plane_root else "nd2"
 
     if not channel_arrays:
         return None
 
     record.raw_cache[cache_key] = channel_arrays
+    record.raw_cache_source[cache_key] = source_tag
     return channel_arrays
 
 
@@ -1382,27 +1646,33 @@ def _load_channels_from_cached_png(
     return channel_arrays or None
 
 
-def _normalize_channel(channel: np.ndarray) -> np.ndarray:
+def _normalize_channel(channel: np.ndarray, range_override: Optional[Tuple[float, float]] = None) -> np.ndarray:
     channel = channel.astype(np.float32)
     channel = np.clip(channel, 0, None)
-    channel -= channel.min()
-    max_val = channel.max()
-    if max_val <= 0:
+    if range_override:
+        vmin, vmax = range_override
+        channel = np.clip(channel, vmin, vmax)
+        channel -= vmin
+        denom = max(vmax - vmin, 1e-6)
+    else:
+        channel -= channel.min()
+        denom = channel.max()
+    if denom <= 0:
         return np.zeros_like(channel, dtype=np.uint8)
-    channel /= max_val
+    channel /= denom
     channel *= 255.0
     return channel.astype(np.uint8)
 
 
-def _generate_raw_image(channels: Dict[int, np.ndarray]) -> Optional[np.ndarray]:
+def _generate_raw_image(channels: Dict[int, np.ndarray], channel_ranges: Dict[int, Tuple[float, float]]) -> Optional[np.ndarray]:
     red_source = channels.get(2) or channels.get(1)
     green_source = channels.get(1) or channels.get(2)
     blue_source = channels.get(3) or channels.get(1)
     if red_source is None or green_source is None or blue_source is None:
         return None
-    red = _normalize_channel(red_source)
-    green = _normalize_channel(green_source)
-    blue = _normalize_channel(blue_source)
+    red = _normalize_channel(red_source, channel_ranges.get(2))
+    green = _normalize_channel(green_source, channel_ranges.get(1))
+    blue = _normalize_channel(blue_source, channel_ranges.get(3))
     return np.stack([red, green, blue], axis=-1)
 
 
@@ -1417,12 +1687,12 @@ def _build_binary_mask(
 
 
 def _generate_channel_raw_image(
-    channels: Dict[int, np.ndarray], channel_id: int
+    channels: Dict[int, np.ndarray], channel_id: int, channel_ranges: Dict[int, Tuple[float, float]]
 ) -> Optional[np.ndarray]:
     channel = channels.get(channel_id)
     if channel is None:
         return None
-    normalized = _normalize_channel(channel)
+    normalized = _normalize_channel(channel, channel_ranges.get(channel_id))
     zeros = np.zeros_like(normalized)
     if channel_id == 1:
         return np.stack([zeros, normalized, zeros], axis=-1)
@@ -1469,9 +1739,12 @@ def _apply_highlight(raw: np.ndarray, mask: np.ndarray, strength: float = 0.45) 
 
 
 def _generate_channel_overlay_image(
-    channels: Dict[int, np.ndarray], thresholds: Dict[str, int], channel_id: int
+    channels: Dict[int, np.ndarray],
+    thresholds: Dict[str, int],
+    channel_id: int,
+    channel_ranges: Dict[int, Tuple[float, float]],
 ) -> Optional[np.ndarray]:
-    raw = _generate_channel_raw_image(channels, channel_id)
+    raw = _generate_channel_raw_image(channels, channel_id, channel_ranges)
     if raw is None:
         return None
     mask = _generate_channel_mask_image(channels, thresholds, channel_id)
@@ -1481,13 +1754,16 @@ def _generate_channel_overlay_image(
 
 
 def _generate_ratio_overlay_image(
-    channels: Dict[int, np.ndarray], thresholds: Dict[str, int], channel_pair: Tuple[int, ...]
+    channels: Dict[int, np.ndarray],
+    thresholds: Dict[str, int],
+    channel_pair: Tuple[int, ...],
+    channel_ranges: Dict[int, Tuple[float, float]],
 ) -> Optional[np.ndarray]:
     if len(channel_pair) != 2:
         return None
     raw_images: List[np.ndarray] = []
     for channel_id in channel_pair:
-        raw_image = _generate_channel_raw_image(channels, channel_id)
+        raw_image = _generate_channel_raw_image(channels, channel_id, channel_ranges)
         if raw_image is None:
             return None
         raw_images.append(raw_image.astype(np.float32))
@@ -1501,8 +1777,12 @@ def _generate_ratio_overlay_image(
     return overlay
 
 
-def _generate_overlay_image(channels: Dict[int, np.ndarray], thresholds: Dict[str, int]) -> Optional[np.ndarray]:
-    raw = _generate_raw_image(channels)
+def _generate_overlay_image(
+    channels: Dict[int, np.ndarray],
+    thresholds: Dict[str, int],
+    channel_ranges: Dict[int, Tuple[float, float]],
+) -> Optional[np.ndarray]:
+    raw = _generate_raw_image(channels, channel_ranges)
     if raw is None:
         return None
     mask = _generate_mask_image(channels, thresholds)
@@ -1512,22 +1792,25 @@ def _generate_overlay_image(channels: Dict[int, np.ndarray], thresholds: Dict[st
 
 
 def _render_preview_variant(
-    channels: Dict[int, np.ndarray], thresholds: Dict[str, int], variant: PreviewVariant
+    channels: Dict[int, np.ndarray],
+    thresholds: Dict[str, int],
+    variant: PreviewVariant,
+    channel_ranges: Dict[int, Tuple[float, float]],
 ) -> Optional[np.ndarray]:
     if variant.variant == "raw":
         if len(variant.channels) == 1:
-            return _generate_channel_raw_image(channels, variant.channels[0])
-        return _generate_raw_image(channels)
+            return _generate_channel_raw_image(channels, variant.channels[0], channel_ranges)
+        return _generate_raw_image(channels, channel_ranges)
     if variant.variant == "mask":
         if len(variant.channels) == 1:
             return _generate_channel_mask_image(channels, thresholds, variant.channels[0])
         return _generate_mask_image(channels, thresholds)
     if variant.variant == "overlay":
         if len(variant.channels) == 1:
-            return _generate_channel_overlay_image(channels, thresholds, variant.channels[0])
+            return _generate_channel_overlay_image(channels, thresholds, variant.channels[0], channel_ranges)
         if len(variant.channels) == 2:
-            return _generate_ratio_overlay_image(channels, thresholds, variant.channels)
-        return _generate_overlay_image(channels, thresholds)
+            return _generate_ratio_overlay_image(channels, thresholds, variant.channels, channel_ranges)
+        return _generate_overlay_image(channels, thresholds, channel_ranges)
     return None
 
 

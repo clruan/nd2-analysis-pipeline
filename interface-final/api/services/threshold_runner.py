@@ -42,9 +42,11 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
     try:
         group_config = GroupConfig.from_json(str(config_path))
         ratio_definitions = normalize_ratio_definitions(group_config.ratios)
+        pixel_size_um = group_config.pixel_size_um
     except Exception:
         # Fall back to defaults when the config cannot be parsed.
-        pass
+        group_config = None
+        pixel_size_um = None
 
     job_id = uuid.uuid4().hex
     study_slug = slugify(input_dir.name)
@@ -66,6 +68,7 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
         source_hash=source_hash,
         metadata_path=metadata_path,
         ratio_definitions=ratio_definitions,
+        pixel_size_um=pixel_size_um,
     )
     STATE.record_run(record)
 
@@ -202,6 +205,9 @@ def _maybe_reuse_existing(
     ratio_payload = metadata.get("ratio_definitions")
     if ratio_payload:
         record.ratio_definitions = normalize_ratio_definitions(ratio_payload)
+    pixel_meta = metadata.get("pixel_size_um")
+    if pixel_meta is not None:
+        record.pixel_size_um = float(pixel_meta)
     preview_root = metadata.get("preview_root")
     if preview_root:
         preview_candidate = Path(preview_root).expanduser()
@@ -225,6 +231,7 @@ def _maybe_reuse_existing(
             completed_at=completed_at,
             sources_latest_mtime=sources_latest_mtime,
             source_hash=source_hash,
+            pixel_size_um=record.pixel_size_um,
         )
         return RunStatus(
             job_id=record.job_id,
@@ -332,6 +339,7 @@ def _write_metadata(
             "source_hash": source_hash,
             "sources": list(sources),
             "ratio_definitions": record.ratio_definitions or list(DEFAULT_RATIO_DEFINITIONS),
+            "pixel_size_um": record.pixel_size_um,
         }
         with metadata_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)

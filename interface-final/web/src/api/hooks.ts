@@ -13,8 +13,12 @@ import type {
   StatisticsResponse,
   UploadResponse,
   RatioUpdateResponse,
-  RatioDefinition
+  RatioDefinition,
+  PixelSizeUpdateResponse,
+  PreviewDownloadResponse
 } from "./types";
+
+export type ChannelRangePayload = Partial<Record<"channel_1" | "channel_2" | "channel_3", { vmin: number; vmax: number }>>;
 
 export function useConfigScan() {
   return useMutation({
@@ -132,7 +136,9 @@ export function usePreviewQuery(
   metrics: string[],
   sampleCount: number,
   groups?: string[],
-  groupLimits?: Record<string, number>
+  groupLimits?: Record<string, number>,
+  channelRanges?: ChannelRangePayload,
+  rangeKey?: string
 ) {
   const metricsKey = metrics.length ? metrics.join("|") : "default";
   const limitsKey =
@@ -152,7 +158,8 @@ export function usePreviewQuery(
       metricsKey,
       groups?.join("|") ?? "all",
       sampleCount,
-      limitsKey
+      limitsKey,
+      rangeKey ?? "default"
     ],
     queryFn: () =>
       api.post<PreviewResponse>(`/studies/${studyId}/previews`, {
@@ -160,7 +167,8 @@ export function usePreviewQuery(
         metrics,
         groups,
         max_samples_per_group: sampleCount,
-        group_sample_limits: groupLimits
+        group_sample_limits: groupLimits,
+        channel_ranges: channelRanges
       }),
     enabled: Boolean(studyId),
     placeholderData: keepPreviousData
@@ -197,6 +205,38 @@ export function useFileUpload() {
         headers: { "Content-Type": "multipart/form-data" }
       });
       return response.data;
+    }
+  });
+}
+
+export function usePreviewDownload(studyId: string | null) {
+  return useMutation({
+    mutationFn: (payload: {
+      group: string;
+      subject_id: string;
+      filename: string;
+      thresholds: Record<string, number>;
+      panel_order: string[];
+      channel_ranges?: ChannelRangePayload;
+      scale_bar_um?: number;
+    }) => {
+      if (!studyId) {
+        return Promise.reject(new Error("Study not loaded"));
+      }
+      return api.post<PreviewDownloadResponse>(`/studies/${studyId}/previews/render`, payload);
+    }
+  });
+}
+
+export function usePixelSizeUpdate(studyId: string | null) {
+  return useMutation({
+    mutationFn: (pixelSize?: number | null) => {
+      if (!studyId) {
+        return Promise.reject(new Error("Study not loaded"));
+      }
+      return api.post<PixelSizeUpdateResponse>(`/studies/${studyId}/pixel-size`, {
+        pixel_size_um: typeof pixelSize === "number" ? pixelSize : null
+      });
     }
   });
 }

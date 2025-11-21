@@ -48,6 +48,9 @@ Examples:
                        
     parser.add_argument('--scale-bar', '-s', type=float, default=DEFAULT_SCALE_BAR_UM,
                        help=f'Scale bar size in micrometers (default: {DEFAULT_SCALE_BAR_UM})')
+
+    parser.add_argument('--pixel-size-um', type=float, dest='pixel_size_um',
+                       help='Pixel size in micrometers per pixel. Overrides config detection.')
                        
     parser.add_argument('--marker', '-m', 
                        help=f'Filename marker for mouse ID extraction (default: C1 for 3D, 20X for 2D)')
@@ -137,6 +140,8 @@ def validate_arguments(args) -> None:
     
     if args.scale_bar <= 0:
         raise ValueError("Scale bar size must be positive")
+    if args.pixel_size_um is not None and args.pixel_size_um <= 0:
+        raise ValueError("Pixel size must be positive when provided")
 
 def print_summary(results, args):
     """Print a summary of the analysis results."""
@@ -152,6 +157,9 @@ def print_summary(results, args):
     print(f"Processing time:         {stats['processing_time_seconds']} seconds")
     print(f"Dimension:              {stats['dimension']}")
     print(f"Parallel jobs:          {stats['parallel_jobs']}")
+    pixel_size = stats.get('pixel_size_um')
+    if pixel_size:
+        print(f"Pixel size:             {pixel_size} µm/pixel")
     
     print(f"\nThresholds used:")
     for channel, value in stats['thresholds_used'].items():
@@ -198,7 +206,8 @@ def main():
         
         # Extract visualization config
         viz_ranges = config_data.get('visualization_ranges')
-        pixel_size_um = config_data.get('pixel_size_um')
+        pixel_size_override = args.pixel_size_um if hasattr(args, 'pixel_size_um') else None
+        pixel_size_um = pixel_size_override if pixel_size_override is not None else config_data.get('pixel_size_um')
         
         if viz_ranges:
             logger.info("Using custom visualization ranges from config file")

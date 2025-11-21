@@ -7,13 +7,15 @@ from typing import Dict, List, Optional, Any
 from pathlib import Path
 import time
 import logging
+import re
 from joblib import Parallel, delayed
 
 from config import (DEFAULT_THRESHOLDS, DEFAULT_PARALLEL_JOBS, DEFAULT_GROUPS, 
                    OUTPUT_FILES, REPRESENTATIVE_SELECTION)
 from data_models import GroupConfig, ProcessingResults, VisualizationConfig
 from image_processing import (get_nd2_files, process_single_file, 
-                             calculate_group_statistics, identify_representative_images)
+                             calculate_group_statistics, identify_representative_images,
+                             detect_pixel_size)
 from excel_output import ExcelReporter
 from visualization import ND2Visualizer
 
@@ -94,6 +96,15 @@ class ND2Pipeline:
             raise ValueError(f"No ND2 files found in {input_dir}")
         
         logger.info(f"Found {len(nd2_files)} ND2 files")
+
+        effective_pixel_size = pixel_size_um or self.config.pixel_size_um
+        if effective_pixel_size is None:
+            detected_pixel_size = detect_pixel_size(nd2_files[0])
+            if detected_pixel_size:
+                effective_pixel_size = detected_pixel_size
+                logger.info(f"Detected pixel size from {os.path.basename(nd2_files[0])}: {detected_pixel_size} µm/pixel")
+            else:
+                logger.warning("Pixel size not provided and could not be detected; scale bars may be inaccurate.")
         
         # Get thresholds
         thresholds = self._get_thresholds(is_3d)
@@ -117,6 +128,10 @@ class ND2Pipeline:
         
         # Create DataFrames
         raw_data = pd.DataFrame([result.to_dict() for result in valid_results])
+        column_metadata: Dict[str, Any] = {}
+        flexible_config = getattr(self, 'flexible_config', None)
+        if flexible_config is not None:
+            column_metadata = self._apply_flexible_annotations(raw_data, flexible_config)
         group_summary = calculate_group_statistics(raw_data)
         
         # Identify representative images
@@ -135,7 +150,8 @@ class ND2Pipeline:
             'mice_analyzed': len(raw_data['MouseID'].unique()),
             'dimension': '3D' if is_3d else '2D',
             'thresholds_used': thresholds,
-            'parallel_jobs': n_jobs
+            'parallel_jobs': n_jobs,
+            'pixel_size_um': effective_pixel_size
         }
         
         # Create results object
@@ -143,7 +159,8 @@ class ND2Pipeline:
             raw_data=raw_data,
             group_summary=group_summary,
             representative_images=representative_images,
-            processing_stats=processing_stats
+            processing_stats=processing_stats,
+            column_metadata=column_metadata
         )
         
         # Save results
@@ -152,7 +169,7 @@ class ND2Pipeline:
         # Create visualizations
         if create_visualizations:
             self._create_visualizations(
-                results, input_dir, output_dir, is_3d, scale_bar_um, viz_ranges, pixel_size_um
+                results, input_dir, output_dir, is_3d, scale_bar_um, viz_ranges, effective_pixel_size
             )
         
         elapsed_time = time.time() - start_time
@@ -168,12 +185,162 @@ class ND2Pipeline:
             return self.config.thresholds[dimension]
         else:
             return DEFAULT_THRESHOLDS[dimension]
+
+    @staticmethod
+    def _legacy_channel_prefix(internal_id: str) -> str:
+        """Convert flexible channel ID to legacy DataFrame prefix."""
+        if internal_id.startswith('channel_'):
+            return f"Channel_{internal_id.split('_')[1]}"
+        return internal_id
+
+    @staticmethod
+    def _format_ratio_suffix(metric_suffix: str) -> str:
+        """Convert metric suffix to a readable label."""
+        suffix_map = {
+            'area': 'Area (%)',
+            'mean_intensity': 'Mean Intensity Ratio',
+            'sum_intensity': 'Total Intensity Ratio',
+            'min_intensity': 'Minimum Intensity Ratio',
+            'max_intensity': 'Maximum Intensity Ratio'
+        }
+        return suffix_map.get(metric_suffix, metric_suffix.replace('_', ' ').title())
+
+    def _apply_flexible_annotations(self, raw_data: pd.DataFrame, flexible_config) -> Dict[str, Any]:
+        """Augment raw data with flexible ratios and prepare display metadata."""
+        if raw_data.empty:
+            return {}
+
+        rename_map: Dict[str, str] = {}
+        ratio_records: List[Dict[str, str]] = []
+        channel_lookup: Dict[str, str] = {}
+
+        ordered_channels = flexible_config.get_ordered_channels()
+
+        # Base channel labels
+        for channel in ordered_channels:
+            prefix = self._legacy_channel_prefix(channel.internal_id)
+            channel_lookup[prefix] = channel.name
+
+            labeled_columns = [
+                (f"{prefix}_area", f"{channel.name} Area (%)"),
+                (f"{prefix}_mean_intensity", f"{channel.name} Mean Intensity"),
+                (f"{prefix}_sum_intensity", f"{channel.name} Total Intensity"),
+                (f"{prefix}_min_intensity", f"{channel.name} Minimum Intensity"),
+                (f"{prefix}_max_intensity", f"{channel.name} Maximum Intensity")
+            ]
+            for column_name, display_label in labeled_columns:
+                if column_name in raw_data.columns:
+                    rename_map[column_name] = display_label
+
+        # Ratio definitions from configuration
+        ratio_name_lookup: Dict[tuple, str] = {}
+        for ratio in flexible_config.ratios:
+            numerator_prefix = self._legacy_channel_prefix(ratio.numerator_channel)
+            denominator_prefix = self._legacy_channel_prefix(ratio.denominator_channel)
+            ratio_name_lookup[(numerator_prefix, denominator_prefix)] = ratio.name
+
+            numerator_area = f"{numerator_prefix}_area"
+            denominator_area = f"{denominator_prefix}_area"
+            area_ratio_column = f"{numerator_prefix}_per_{denominator_prefix}_area"
+
+            if (
+                area_ratio_column not in raw_data.columns
+                and numerator_area in raw_data.columns
+                and denominator_area in raw_data.columns
+            ):
+                denominator_values = raw_data[denominator_area]
+                raw_data[area_ratio_column] = np.where(
+                    denominator_values > 0,
+                    raw_data[numerator_area] / denominator_values * 100.0,
+                    np.nan
+                )
+
+            if area_ratio_column in raw_data.columns:
+                rename_map[area_ratio_column] = f"{ratio.name} (Area %)"
+                ratio_records.append({
+                    'column': area_ratio_column,
+                    'label': rename_map[area_ratio_column]
+                })
+
+            # Additional intensity ratios
+            for suffix, descriptor in [
+                ('_mean_intensity', ' Mean Intensity Ratio'),
+                ('_sum_intensity', ' Total Intensity Ratio')
+            ]:
+                numerator_metric = f"{numerator_prefix}{suffix}"
+                denominator_metric = f"{denominator_prefix}{suffix}"
+                ratio_metric_column = f"{numerator_prefix}_per_{denominator_prefix}{suffix}"
+
+                if (
+                    ratio_metric_column not in raw_data.columns
+                    and numerator_metric in raw_data.columns
+                    and denominator_metric in raw_data.columns
+                ):
+                    denominator_values = raw_data[denominator_metric]
+                    raw_data[ratio_metric_column] = np.where(
+                        denominator_values != 0,
+                        raw_data[numerator_metric] / denominator_values,
+                        np.nan
+                    )
+
+                if ratio_metric_column in raw_data.columns:
+                    rename_map[ratio_metric_column] = f"{ratio.name}{descriptor}"
+                    ratio_records.append({
+                        'column': ratio_metric_column,
+                        'label': rename_map[ratio_metric_column]
+                    })
+
+        # Provide readable names for any remaining ratio columns
+        ratio_pattern = re.compile(r'^(Channel_\d+)_per_(Channel_\d+)_([A-Za-z_]+)$')
+        for column_name in [c for c in raw_data.columns if '_per_' in c]:
+            if column_name in rename_map:
+                continue
+
+            match = ratio_pattern.match(column_name)
+            if not match:
+                continue
+
+            numerator_prefix, denominator_prefix, metric_suffix = match.groups()
+            numerator_name = channel_lookup.get(numerator_prefix, numerator_prefix)
+            denominator_name = channel_lookup.get(denominator_prefix, denominator_prefix)
+
+            base_label = ratio_name_lookup.get(
+                (numerator_prefix, denominator_prefix),
+                f"{numerator_name} per {denominator_name}"
+            )
+            metric_label = self._format_ratio_suffix(metric_suffix)
+            rename_map[column_name] = f"{base_label} {metric_label}"
+            ratio_records.append({
+                'column': column_name,
+                'label': rename_map[column_name]
+            })
+
+        return {
+            'display_names': rename_map,
+            'channels': [
+                {
+                    'internal_id': channel.internal_id,
+                    'name': channel.name,
+                    'color': channel.color_name,
+                    'display_order': channel.display_order
+                }
+                for channel in ordered_channels
+            ],
+            'ratio_columns': ratio_records
+        }
     
     def _save_results(self, results: ProcessingResults, output_dir: str) -> None:
-        """Save analysis results to files."""        # Save to Excel
+        """Save analysis results to files."""
+        # Save to Excel
         excel_path = os.path.join(output_dir, OUTPUT_FILES['excel_report'])
         try:
-            success = self.excel_reporter.create_simple_report(results, excel_path)
+            # If flexible configuration is available on the pipeline config, prefer enriched report
+            success = False
+            flexible_config = getattr(self, 'flexible_config', None)
+            if flexible_config is not None and hasattr(self.excel_reporter, 'create_flexible_report'):
+                success = self.excel_reporter.create_flexible_report(results, flexible_config, excel_path)
+            else:
+                success = self.excel_reporter.create_simple_report(results, excel_path)
             if success:
                 logger.info(f"Excel report saved: {excel_path}")
             else:

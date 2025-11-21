@@ -31,6 +31,7 @@ class RunRecord:
     metadata_path: Optional[Path] = None
     preview_root: Optional[Path] = None
     ratio_definitions: List[Dict[str, object]] = field(default_factory=list)
+    pixel_size_um: Optional[float] = None
 
 
 @dataclass
@@ -46,6 +47,7 @@ class StudyRecord:
     is_3d: bool = True
     loaded_at: datetime = field(default_factory=datetime.utcnow)
     ratio_definitions: List[Dict[str, object]] = field(default_factory=lambda: list(DEFAULT_RATIO_DEFINITIONS))
+    pixel_size_um: Optional[float] = None
 
 
 class GlobalState:

@@ -1,12 +1,29 @@
-import { Fragment, useMemo, useState } from "react";
-import { Alert, Box, Button, CircularProgress, IconButton, Slider, Stack, TextField, Tooltip, Typography } from "@mui/material";
+import { Fragment, useEffect, useMemo, useState } from "react";
+import {
+  Alert,
+  Box,
+  Button,
+  Checkbox,
+  CircularProgress,
+  FormControlLabel,
+  Collapse,
+  IconButton,
+  Stack,
+  Tooltip,
+  Typography
+} from "@mui/material";
 import { useAppStore } from "../state/useAppStore";
 import { useThresholds } from "../hooks/useThresholds";
-import { usePreviewQuery, useClearPreviewsMutation } from "../api/hooks";
+import { usePreviewRanges } from "../hooks/usePreviewRanges";
+import { usePreviewQuery, useClearPreviewsMutation, usePreviewDownload } from "../api/hooks";
 import type { PreviewImage } from "../api/types";
 import { apiClient } from "../api/client";
 import DownloadIcon from "@mui/icons-material/FileDownloadOutlined";
 import RefreshIcon from "@mui/icons-material/RefreshOutlined";
+import KeyboardArrowUpIcon from "@mui/icons-material/KeyboardArrowUp";
+import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
+import ExpandLessIcon from "@mui/icons-material/ExpandLess";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import { CHANNEL_METRICS } from "../constants/metrics";
 
 type Variant = PreviewImage["variant"];
@@ -22,7 +39,7 @@ interface PreviewColumn {
 const variantOrder: Variant[] = ["raw", "mask", "overlay"];
 
 const variantLabels: Record<Variant, string> = {
-  raw: "Raw",
+  raw: "Image-scaled",
   mask: "Mask",
   overlay: "Overlay"
 };
@@ -38,12 +55,12 @@ export default function PreviewPane() {
     study,
     statisticsSettings,
     selectedMetric,
-    previewSamplesPerGroup,
-    setPreviewSamplesPerGroup,
     ratioDefinitions,
-    previewGroupOverrides,
-    setPreviewGroupOverride,
-    resetPreviewGroupOverrides
+    previewPanelOrder,
+    setPreviewPanelOrder,
+    resetPreviewPanelOrder,
+    previewScaleBarEnabled,
+    setPreviewScaleBarEnabled
   } = useAppStore();
   const { debounced } = useThresholds();
   const metricsCatalog = useMemo(() => {
@@ -66,18 +83,25 @@ export default function PreviewPane() {
       }, {}),
     [metricsCatalog]
   );
-  const [showOverrides, setShowOverrides] = useState(false);
+  const { payload: channelRangesPayload, debouncedPayload: debouncedChannelRanges, debouncedSignature: rangeSignature } =
+    usePreviewRanges(350);
+  const sampleCount = 1;
 
   const previewQuery = usePreviewQuery(
     study?.study_id ?? null,
     debounced,
     metricsForPreview,
-    previewSamplesPerGroup,
+    sampleCount,
     undefined,
-    previewGroupOverrides
+    undefined,
+    debouncedChannelRanges,
+    rangeSignature
   );
   const clearCacheMutation = useClearPreviewsMutation(study?.study_id ?? null);
   const refreshMutation = useClearPreviewsMutation(study?.study_id ?? null);
+  const previewDownload = usePreviewDownload(study?.study_id ?? null);
+  const [activePanelDownload, setActivePanelDownload] = useState<string | null>(null);
+  const [panelControlsCollapsed, setPanelControlsCollapsed] = useState(false);
   const thresholdKey = `${debounced.channel_1}-${debounced.channel_2}-${debounced.channel_3}`;
   const handleRefreshPreviews = () => {
     if (!study) return;
@@ -101,6 +125,14 @@ export default function PreviewPane() {
       }
     );
   };
+
+  // Force preview refresh when LUT ranges change so raw/overlay reflect the latest window.
+  useEffect(() => {
+    if (study) {
+      void previewQuery.refetch();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rangeSignature]);
 
   const groupedPreviews = useMemo<PreviewColumn[]>(() => {
     if (!previewQuery.data) return [];
@@ -158,6 +190,67 @@ export default function PreviewPane() {
       })
     );
   }, [groupedPreviews, metricsCatalog]);
+  const panelOptions = [
+    { id: "channel_1", label: "Channel 1 (Green)" },
+    { id: "channel_2", label: "Channel 2 (Red)" },
+    { id: "channel_3", label: "Channel 3 (Blue)" },
+    { id: "composite", label: "Composite RGB" }
+  ] as const;
+  type PanelOptionId = (typeof panelOptions)[number]["id"];
+
+  const handleTogglePanel = (panelId: PanelOptionId, enabled: boolean) => {
+    if (enabled) {
+      if (!previewPanelOrder.includes(panelId)) {
+        setPreviewPanelOrder([...previewPanelOrder, panelId]);
+      }
+    } else {
+      const filtered = previewPanelOrder.filter((panel) => panel !== panelId);
+      setPreviewPanelOrder(filtered);
+    }
+  };
+
+  const handleMovePanel = (panelId: PanelOptionId, direction: number) => {
+    const currentIndex = previewPanelOrder.indexOf(panelId);
+    if (currentIndex === -1) {
+      return;
+    }
+    const targetIndex = currentIndex + direction;
+    if (targetIndex < 0 || targetIndex >= previewPanelOrder.length) {
+      return;
+    }
+    const next = [...previewPanelOrder];
+    next.splice(currentIndex, 1);
+    next.splice(targetIndex, 0, panelId);
+    setPreviewPanelOrder(next);
+  };
+
+  const handlePanelDownload = (column: PreviewColumn) => {
+    if (!study) return;
+    setActivePanelDownload(column.key);
+    previewDownload.mutate(
+      {
+        group: column.group,
+        subject_id: column.subjectId,
+        filename: column.filename,
+        thresholds: debounced,
+        panel_order: previewPanelOrder,
+        channel_ranges: channelRangesPayload,
+        include_scale_bar: previewScaleBarEnabled
+      },
+      {
+        onSuccess: (response) => {
+          const url = `${apiBase}/studies/${study.study_id}/preview-file?path=${encodeURIComponent(response.image_path)}&dl=1`;
+          const anchor = document.createElement("a");
+          anchor.href = url;
+          anchor.download = `${column.group}_${column.subjectId}_panel.png`;
+          document.body.appendChild(anchor);
+          anchor.click();
+          document.body.removeChild(anchor);
+        },
+        onSettled: () => setActivePanelDownload(null)
+      }
+    );
+  };
 
   if (!study) {
     return (
@@ -181,7 +274,7 @@ export default function PreviewPane() {
       <Stack spacing={1.5} px={1} py={2}>
         <Typography variant="h6">Live Previews</Typography>
         <Typography variant="body2" color="text.secondary">
-          Adjust thresholds to generate preview overlays. Use the selector to request additional subjects per group.
+          Use the Min/Threshold/Max controls in the left panel to update masks and intensity windows.
         </Typography>
       </Stack>
     );
@@ -216,64 +309,77 @@ export default function PreviewPane() {
             </Stack>
           )}
         </Box>
-        <Stack spacing={0.5} sx={{ minWidth: 220 }}>
-          <Typography variant="caption" color="text.secondary">
-            Samples per group: {previewSamplesPerGroup}
-          </Typography>
-          <Slider
-            size="small"
-            min={1}
-            max={4}
-            step={1}
-            value={previewSamplesPerGroup}
-            onChange={(_, value) => {
-              const numeric = Array.isArray(value) ? value[0] : value;
-              setPreviewSamplesPerGroup(typeof numeric === "number" ? numeric : 1);
-            }}
-            valueLabelDisplay="auto"
-          />
-          {previewQuery.data?.group_sample_counts && (
-            <Typography variant="caption" color="text.secondary">
-              Rendered subjects:{" "}
-              {study.groups
-                .map((group) => `${group}=${previewQuery.data?.group_sample_counts[group] ?? 0}`)
-                .join(" • ")}
+        <Box
+          sx={{
+            minWidth: 240,
+            border: "1px solid rgba(15,23,42,0.08)",
+            borderRadius: 1.25,
+            p: 1
+          }}
+        >
+          <Stack direction="row" alignItems="center" justifyContent="space-between">
+            <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600, textTransform: "uppercase" }}>
+              Panel order
             </Typography>
-          )}
-          {study.groups.length > 0 && (
-            <Button variant="text" size="small" onClick={() => setShowOverrides((current) => !current)}>
-              {showOverrides ? "Hide per-group overrides" : "Adjust per-group overrides"}
-            </Button>
-          )}
-          {showOverrides && (
-            <Stack spacing={0.75} sx={{ border: "1px solid rgba(15,23,42,0.08)", borderRadius: 1, p: 1 }}>
-              {study.groups.map((group) => (
-                <TextField
-                  key={`override-${group}`}
-                  size="small"
-                  type="number"
-                  label={group}
-                  inputProps={{ min: 1, max: 6 }}
-                  value={previewGroupOverrides[group] ?? ""}
-                  onChange={(event) => {
-                    if (!event.target.value) {
-                      setPreviewGroupOverride(group, null);
-                      return;
-                    }
-                    const numeric = Number(event.target.value);
-                    if (Number.isNaN(numeric)) {
-                      return;
-                    }
-                    setPreviewGroupOverride(group, numeric);
-                  }}
-                />
-              ))}
-              <Button variant="text" size="small" onClick={resetPreviewGroupOverrides}>
-                Reset overrides
+            <IconButton size="small" onClick={() => setPanelControlsCollapsed((prev) => !prev)}>
+              {panelControlsCollapsed ? <ExpandMoreIcon fontSize="small" /> : <ExpandLessIcon fontSize="small" />}
+            </IconButton>
+          </Stack>
+          <Collapse in={!panelControlsCollapsed}>
+            <Stack spacing={0.5} mt={0.5}>
+              {panelOptions.map((option) => {
+                const enabled = previewPanelOrder.includes(option.id);
+                const position = previewPanelOrder.indexOf(option.id);
+                return (
+                  <Stack direction="row" spacing={0.5} alignItems="center" key={`panel-${option.id}`}>
+                    <Checkbox
+                      size="small"
+                      checked={enabled}
+                      onChange={(event) => handleTogglePanel(option.id, event.target.checked)}
+                    />
+                    <Typography variant="caption" sx={{ minWidth: 140 }}>
+                      {option.label}
+                    </Typography>
+                    <IconButton
+                      size="small"
+                      disabled={!enabled || position <= 0}
+                      onClick={() => handleMovePanel(option.id, -1)}
+                    >
+                      <KeyboardArrowUpIcon fontSize="inherit" />
+                    </IconButton>
+                    <IconButton
+                      size="small"
+                      disabled={!enabled || position === previewPanelOrder.length - 1 || position === -1}
+                      onClick={() => handleMovePanel(option.id, 1)}
+                    >
+                      <KeyboardArrowDownIcon fontSize="inherit" />
+                    </IconButton>
+                    <Typography variant="caption" color="text.secondary">
+                      {enabled && position >= 0 ? `Pos ${position + 1}` : "Hidden"}
+                    </Typography>
+                  </Stack>
+                );
+              })}
+              <Button variant="text" size="small" onClick={resetPreviewPanelOrder}>
+                Reset order
               </Button>
             </Stack>
-          )}
-        </Stack>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  size="small"
+                  checked={previewScaleBarEnabled}
+                  onChange={(event) => setPreviewScaleBarEnabled(event.target.checked)}
+                />
+              }
+              label={
+                <Typography variant="caption" color="text.secondary">
+                  Include scale bar in downloads (last panel/composite)
+                </Typography>
+              }
+            />
+          </Collapse>
+        </Box>
         <Stack direction="row" spacing={1} alignItems="center">
           <Button
             variant="contained"
@@ -320,32 +426,46 @@ export default function PreviewPane() {
         </Typography>
       )}
 
-      <Box
-        sx={{
-          display: "grid",
-          gridTemplateColumns: `max-content repeat(${groupedPreviews.length}, minmax(${imageWidth}px, 1fr))`,
-          columnGap: 1,
-          alignItems: "end"
-        }}
-      >
-        <Box />
-        {groupedPreviews.map((column) => (
-          <Tooltip
-            key={`header-${column.key}`}
-            title={
-              <Stack spacing={0.25}>
-                <Typography variant="caption">Subject: {column.subjectId}</Typography>
-                <Typography variant="caption">File: {column.filename}</Typography>
-              </Stack>
-            }
-            placement="top"
-          >
-            <Typography variant="subtitle2" noWrap>
-              {column.group}
-            </Typography>
-          </Tooltip>
-        ))}
-      </Box>
+        <Box
+          sx={{
+            display: "grid",
+            gridTemplateColumns: `max-content repeat(${groupedPreviews.length}, minmax(${imageWidth}px, 1fr))`,
+            columnGap: 1,
+            alignItems: "center"
+          }}
+        >
+          <Box />
+          {groupedPreviews.map((column) => (
+            <Stack key={`header-${column.key}`} direction="row" spacing={0.25} alignItems="center">
+              <Tooltip
+                title={
+                  <Stack spacing={0.25}>
+                    <Typography variant="caption">Subject: {column.subjectId}</Typography>
+                    <Typography variant="caption">File: {column.filename}</Typography>
+                  </Stack>
+                }
+                placement="top"
+              >
+                <Typography variant="subtitle2" noWrap>
+                  {column.group}
+                </Typography>
+              </Tooltip>
+              <Tooltip title="Download adjusted panel">
+                <IconButton
+                  size="small"
+                  onClick={() => handlePanelDownload(column)}
+                  disabled={previewDownload.isPending && activePanelDownload === column.key}
+                >
+                  {previewDownload.isPending && activePanelDownload === column.key ? (
+                    <CircularProgress size={12} thickness={6} />
+                  ) : (
+                    <DownloadIcon fontSize="inherit" />
+                  )}
+                </IconButton>
+              </Tooltip>
+            </Stack>
+          ))}
+        </Box>
       <Stack spacing={1.5}>
         {metricsWithData.map((metric) => (
           <Stack key={`metric-${metric.id}`} spacing={0.75}>
@@ -404,11 +524,12 @@ export default function PreviewPane() {
                       >
                         {images.length > 0 ? (
                           images.map((image) => {
-                            const cacheBust = image.variant === "raw" ? "" : `&v=${encodeURIComponent(token)}`;
+                            const cacheSeed = `${token}-${rangeSignature}`;
                             const src = `${apiBase}/studies/${study.study_id}/preview-file?path=${encodeURIComponent(
                               image.image_path
-                            )}${cacheBust}`;
-                            const downloadName = `${image.group}_${image.metric}_${image.variant}.png`;
+                            )}&v=${encodeURIComponent(cacheSeed)}`;
+                            const variantName = image.variant === "raw" ? "image-scaled" : image.variant;
+                            const downloadName = `${image.group}_${image.metric}_${variantName}.png`;
                             return (
                               <Box
                                 key={`${column.key}-${metric.id}-${previewKey(image)}`}

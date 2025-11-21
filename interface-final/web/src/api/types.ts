@@ -50,6 +50,7 @@ export interface LoadedStudy {
   nd2_root: string;
   nd2_available: boolean;
   ratio_definitions: RatioDefinition[];
+  pixel_size_um?: number | null;
 }
 
 export interface RatioDefinition {
@@ -115,6 +116,11 @@ export interface PreviewResponse {
   group_sample_counts: Record<string, number>;
 }
 
+export interface PreviewDownloadResponse {
+  image_path: string;
+  panel_order: string[];
+}
+
 export interface PreviewClearResponse {
   removed_directories: string[];
 }
@@ -122,6 +128,10 @@ export interface PreviewClearResponse {
 export interface DownloadResponse {
   download_path: string;
   generated_at: string;
+}
+
+export interface PixelSizeUpdateResponse {
+  pixel_size_um?: number | null;
 }
 
 export interface UploadResponse {

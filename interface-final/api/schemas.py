@@ -149,6 +149,11 @@ class StatisticsResponse(BaseModel):
     ratios: List[RatioDefinition]
 
 
+class ChannelRange(BaseModel):
+    vmin: float = Field(0, ge=0)
+    vmax: float = Field(1, ge=0)
+
+
 class PreviewRequest(BaseModel):
     thresholds: Dict[str, int]
     groups: Optional[List[str]] = None
@@ -156,6 +161,7 @@ class PreviewRequest(BaseModel):
     metric: Optional[str] = None
     metrics: Optional[List[str]] = None
     group_sample_limits: Optional[Dict[str, int]] = None
+    channel_ranges: Optional[Dict[str, ChannelRange]] = None
 
 
 class PreviewImage(BaseModel):
@@ -179,6 +185,21 @@ class PreviewResponse(BaseModel):
     group_sample_counts: Dict[str, int]
 
 
+class PreviewDownloadRequest(BaseModel):
+    group: str
+    subject_id: str
+    filename: str
+    thresholds: Dict[str, int]
+    channel_ranges: Optional[Dict[str, ChannelRange]] = None
+    panel_order: Optional[List[str]] = None
+    scale_bar_um: Optional[float] = None
+
+
+class PreviewDownloadResponse(BaseModel):
+    image_path: str
+    panel_order: List[str]
+
+
 class PreviewClearRequest(BaseModel):
     scope: Literal["thresholds", "all"] = "thresholds"
     threshold_key: Optional[str] = None
@@ -191,6 +212,14 @@ class PreviewClearResponse(BaseModel):
 class DownloadResponse(BaseModel):
     download_path: str
     generated_at: datetime
+
+
+class PixelSizeUpdateRequest(BaseModel):
+    pixel_size_um: Optional[float] = Field(None, gt=0)
+
+
+class PixelSizeUpdateResponse(BaseModel):
+    pixel_size_um: Optional[float] = None
 
 
 class UploadResponse(BaseModel):

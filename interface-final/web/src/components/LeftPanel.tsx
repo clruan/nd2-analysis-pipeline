@@ -27,7 +27,8 @@ import {
   useLoadStudy,
   useRunStatus,
   useThresholdRun,
-  useUpdateRatios
+  useUpdateRatios,
+  usePixelSizeUpdate
 } from "../api/hooks";
 import type { ConfigScanResponse, RatioDefinition } from "../api/types";
 import { DEFAULT_RATIO_DEFINITIONS } from "../constants/metrics";
@@ -169,7 +170,11 @@ export default function LeftPanel() {
     setPalette,
     setJitterEnabled,
     setJitterWidth,
-    setRatioDefinitions
+    setRatioDefinitions,
+    previewChannelRanges,
+    setPreviewChannelRange,
+    resetPreviewChannelRanges,
+    updateStudy
   } = useAppStore();
   const [inputDir, setInputDir] = useState("");
   const [configPath, setConfigPath] = useState("");
@@ -190,6 +195,8 @@ export default function LeftPanel() {
   const [ratioDrafts, setRatioDrafts] = useState<RatioDefinition[]>(DEFAULT_RATIO_DEFINITIONS);
   const [studyRatioDrafts, setStudyRatioDrafts] = useState<RatioDefinition[]>(DEFAULT_RATIO_DEFINITIONS);
   const [palettePresetOverride, setPalettePresetOverride] = useState<string | null>(null);
+  const [studyPixelSize, setStudyPixelSize] = useState("");
+  const [pixelSizeError, setPixelSizeError] = useState<string | null>(null);
 
   const scanMutation = useConfigScan();
   const configMutation = useConfigCreate();
@@ -199,10 +206,39 @@ export default function LeftPanel() {
   const statusQuery = useRunStatus(jobId);
   const uploadMutation = useFileUpload();
   const updateRatiosMutation = useUpdateRatios(study?.study_id ?? null);
+  const pixelSizeMutation = usePixelSizeUpdate(study?.study_id ?? null);
   const configInputRef = useRef<HTMLInputElement>(null);
   const resultsInputRef = useRef<HTMLInputElement>(null);
 
   const studyGroups = useMemo(() => study?.groups ?? [], [study?.groups]);
+
+  const handleStudyPixelSizeSave = () => {
+    if (!study) return;
+    setPixelSizeError(null);
+    const trimmed = studyPixelSize.trim();
+    let value: number | null = null;
+    if (trimmed !== "") {
+      const parsed = Number(trimmed);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        setPixelSizeError("Enter a positive value or leave blank to clear.");
+        return;
+      }
+      value = parsed;
+    }
+    pixelSizeMutation.mutate(value, {
+      onSuccess: (response) => {
+        updateStudy({ pixel_size_um: response.pixel_size_um ?? null });
+        if (!response.pixel_size_um) {
+          setStudyPixelSize("");
+        } else {
+          setStudyPixelSize(String(response.pixel_size_um));
+        }
+      },
+      onError: (error) => {
+        setPixelSizeError(getErrorMessage(error));
+      }
+    });
+  };
 
   useEffect(() => {
     setGroupsJson(JSON.stringify(groupMap, null, 2));
@@ -215,6 +251,15 @@ export default function LeftPanel() {
   useEffect(() => {
     setPalettePresetOverride(null);
   }, [study?.study_id]);
+
+  useEffect(() => {
+    if (typeof study?.pixel_size_um === "number" && Number.isFinite(study.pixel_size_um)) {
+      setStudyPixelSize(String(study.pixel_size_um));
+    } else {
+      setStudyPixelSize("");
+    }
+    setPixelSizeError(null);
+  }, [study?.pixel_size_um]);
 
   useEffect(() => {
     setSubjectInputs((prev) => {
@@ -455,12 +500,20 @@ export default function LeftPanel() {
     }
   };
 
-  const clampThresholdValue = (value: number) => Math.max(0, Math.min(4095, value));
-  const applyThresholdValue = (channel: "channel_1" | "channel_2" | "channel_3", value: number) => {
-    if (Number.isNaN(value)) {
-      return;
-    }
-    setThreshold(channel, clampThresholdValue(value));
+  const clampIntensity = (value: number) => Math.max(0, Math.min(4095, Math.round(value)));
+  const applyChannelWindow = (
+    channel: "channel_1" | "channel_2" | "channel_3",
+    next: { min?: number; threshold?: number; max?: number }
+  ) => {
+    const [currentMin, currentMax] = previewChannelRanges[channel];
+    const min = clampIntensity(next.min ?? currentMin);
+    const maxCandidate = clampIntensity(next.max ?? currentMax);
+    const resolvedMin = Math.min(min, maxCandidate);
+    const resolvedMax = Math.max(resolvedMin + 1, maxCandidate);
+    const thresholdValue = clampIntensity(next.threshold ?? thresholds[channel]);
+    const clampedThreshold = Math.min(Math.max(thresholdValue, resolvedMin), resolvedMax);
+    setPreviewChannelRange(channel, [resolvedMin, resolvedMax]);
+    setThreshold(channel, clampedThreshold);
   };
 
   const removeRatioDraft = (setter: React.Dispatch<React.SetStateAction<RatioDefinition[]>>, index: number) => {
@@ -601,48 +654,52 @@ export default function LeftPanel() {
 
   return (
     <Stack spacing={2} px={3} py={3} sx={{ minHeight: "100%" }}>
-      <Box>
-        <Typography variant="h6" gutterBottom>
-          Study Pipeline
-        </Typography>
-        <Typography variant="body2" color="text.secondary" gutterBottom>
-          Provide the ND2 directory and optional config path. The interface can scan the folder, create a configuration, run threshold generation, and load the results—all from here.
-        </Typography>
-      </Box>
+      {!study && (
+        <Box>
+          <Typography variant="h6" gutterBottom>
+            Study Pipeline
+          </Typography>
+          <Typography variant="body2" color="text.secondary" gutterBottom>
+            Provide the ND2 directory and optional config path. The interface can scan the folder, create a configuration, run threshold generation, and load the results—all from here.
+          </Typography>
+        </Box>
+      )}
 
-      <Box
-        sx={{
-          borderRadius: 2,
-          border: "1px solid rgba(15,23,42,0.1)",
-          p: 2,
-          backgroundColor: "#ffffff"
-        }}
-      >
-        <Typography variant="subtitle2" gutterBottom>
-          Interactive workflow
-        </Typography>
-        <Stack spacing={1}>
-          {workflowSteps.map((step, index) => (
-            <Box
-              key={step.id}
-              sx={{ borderRadius: 1.5, p: 1, backgroundColor: step.state === "active" ? "rgba(37,99,235,0.08)" : "transparent" }}
-            >
-              <Stack direction="row" spacing={1} alignItems="center">
-                <Chip
-                  label={`Step ${index + 1}`}
-                  size="small"
-                  color={step.state === "completed" ? "success" : step.state === "active" ? "primary" : "default"}
-                  variant={step.state === "upcoming" ? "outlined" : "filled"}
-                />
-                <Typography variant="body2">{step.title}</Typography>
-              </Stack>
-              <Typography variant="caption" color="text.secondary" sx={{ ml: 5 }}>
-                {step.description}
-              </Typography>
-            </Box>
-          ))}
-        </Stack>
-      </Box>
+      {!study && (
+        <Box
+          sx={{
+            borderRadius: 2,
+            border: "1px solid rgba(15,23,42,0.1)",
+            p: 2,
+            backgroundColor: "#ffffff"
+          }}
+        >
+          <Typography variant="subtitle2" gutterBottom>
+            Interactive workflow
+          </Typography>
+          <Stack spacing={1}>
+            {workflowSteps.map((step, index) => (
+              <Box
+                key={step.id}
+                sx={{ borderRadius: 1.5, p: 1, backgroundColor: step.state === "active" ? "rgba(37,99,235,0.08)" : "transparent" }}
+              >
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Chip
+                    label={`Step ${index + 1}`}
+                    size="small"
+                    color={step.state === "completed" ? "success" : step.state === "active" ? "primary" : "default"}
+                    variant={step.state === "upcoming" ? "outlined" : "filled"}
+                  />
+                  <Typography variant="body2">{step.title}</Typography>
+                </Stack>
+                <Typography variant="caption" color="text.secondary" sx={{ ml: 5 }}>
+                  {step.description}
+                </Typography>
+              </Box>
+            ))}
+          </Stack>
+        </Box>
+      )}
 
 
       <Box sx={sectionSx("nd2")}>
@@ -1005,39 +1062,95 @@ export default function LeftPanel() {
 
       <Box sx={sectionSx("run")}>
         <Stack spacing={1.5}>
-        <Typography variant="subtitle1">Threshold Controls</Typography>
+        <Typography variant="subtitle1">Threshold &amp; Range</Typography>
         <Typography variant="caption" color="text.secondary">
-          Adjust the sliders to explore different channel cutoffs. Charts and previews update instantly.
+          Threshold only controls the mask; Min/Max control the raw intensity window for live previews. Overlay combines both.
         </Typography>
-        {(["channel_1", "channel_2", "channel_3"] as const).map((channel, index) => (
-          <Box key={channel}>
-            <Stack direction="row" spacing={1} alignItems="center">
-              <Typography variant="caption" color="text.secondary" sx={{ minWidth: 90 }}>
-                {`Channel ${index + 1}`}
-              </Typography>
-              <TextField
+        {(["channel_1", "channel_2", "channel_3"] as const).map((channel, index) => {
+          const range = previewChannelRanges[channel];
+          const thresholdValue = Math.min(Math.max(thresholds[channel], range[0]), range[1]);
+          return (
+            <Box key={channel}>
+              <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+                <Typography variant="caption" color="text.secondary">
+                  {`Channel ${index + 1}`}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {`Min ${range[0]} • Thr ${thresholdValue} • Max ${range[1]}`}
+                </Typography>
+              </Stack>
+              <Slider
                 size="small"
-                type="number"
-                value={thresholds[channel]}
-                inputProps={{ min: 0, max: 4095 }}
-                onChange={(event) => applyThresholdValue(channel, Number(event.target.value))}
-                sx={{ width: 120 }}
+                min={0}
+                max={4095}
+                marks={sliderMarks}
+                disableSwap
+                sx={{
+                  color: "rgba(15,23,42,0.35)",
+                  mt: 1,
+                  "& .MuiSlider-thumb": {
+                    width: 14,
+                    height: 14,
+                    boxShadow: "0 1px 2px rgba(15,23,42,0.12)"
+                  },
+                  // Threshold handle (middle) as a short strip
+                  "& .MuiSlider-thumb[data-index='1']": {
+                    bgcolor: "#64748b",
+                    width: 28,
+                    height: 8,
+                    borderRadius: 4,
+                    border: "1px solid #cbd5e1"
+                  },
+                  // Min & Max handles as blue round knobs
+                  "& .MuiSlider-thumb[data-index='0'], & .MuiSlider-thumb[data-index='2']": {
+                    bgcolor: "#2563eb",
+                    border: "2px solid #bfdbfe",
+                    width: 16,
+                    height: 16,
+                    borderRadius: 999,
+                    boxShadow: "0 0 0 4px rgba(37,99,235,0.18)"
+                  }
+                }}
+                value={[range[0], thresholdValue, range[1]]}
+                onChange={(_, value) => {
+                  if (!Array.isArray(value) || value.length !== 3) {
+                    return;
+                  }
+                  applyChannelWindow(channel, { min: value[0], threshold: value[1], max: value[2] });
+                }}
               />
-            </Stack>
-            <Slider
-              size="small"
-              min={0}
-              max={4095}
-              marks={sliderMarks}
-              sx={{ color: "primary.main", mt: 1 }}
-              value={thresholds[channel]}
-              onChange={(_, value) => {
-                const numeric = Array.isArray(value) ? value[0] : value;
-                applyThresholdValue(channel, numeric);
-              }}
-            />
-          </Box>
-        ))}
+              <Stack direction="row" spacing={1}>
+                <TextField
+                  size="small"
+                  type="number"
+                  label="Min"
+                  value={range[0]}
+                  inputProps={{ min: 0, max: 4095 }}
+                  onChange={(event) => applyChannelWindow(channel, { min: Number(event.target.value) })}
+                />
+                <TextField
+                  size="small"
+                  type="number"
+                  label="Threshold"
+                  value={thresholdValue}
+                  inputProps={{ min: 0, max: 4095 }}
+                  onChange={(event) => applyChannelWindow(channel, { threshold: Number(event.target.value) })}
+                />
+                <TextField
+                  size="small"
+                  type="number"
+                  label="Max"
+                  value={range[1]}
+                  inputProps={{ min: 1, max: 4095 }}
+                  onChange={(event) => applyChannelWindow(channel, { max: Number(event.target.value) })}
+                />
+              </Stack>
+            </Box>
+          );
+        })}
+        <Button variant="text" size="small" onClick={resetPreviewChannelRanges}>
+          Reset ranges
+        </Button>
         <FormControlLabel
           control={<Checkbox size="small" checked={statisticsEnabled} onChange={(event) => setStatisticsEnabled(event.target.checked)} />}
           label="Enable statistical analysis"
@@ -1530,6 +1643,30 @@ export default function LeftPanel() {
             ND2 directory unavailable at {study.nd2_root}. Mount or copy the folder, update “ND2 Input Directory”, and load the study
             again to unlock previews.
           </Alert>
+        )}
+        {study && (
+          <Stack spacing={0.5}>
+            <Typography variant="subtitle1">Pixel size (µm/pixel)</Typography>
+            <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ sm: "center" }}>
+              <TextField
+                label="Pixel size"
+                size="small"
+                type="number"
+                inputProps={{ step: "0.001", min: "0" }}
+                value={studyPixelSize}
+                onChange={(event) => setStudyPixelSize(event.target.value)}
+                error={Boolean(pixelSizeError)}
+                helperText={pixelSizeError ?? "Leave blank to clear"}
+                sx={{ maxWidth: 220 }}
+              />
+              <Button variant="outlined" size="small" onClick={handleStudyPixelSizeSave} disabled={pixelSizeMutation.isPending}>
+                {pixelSizeMutation.isPending ? "Saving..." : "Save"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              Controls scale bars for preview panels and downloads.
+            </Typography>
+          </Stack>
         )}
         {study && (
           <Stack spacing={1}>

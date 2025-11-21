@@ -28,6 +28,10 @@ from .schemas import (
     PreviewResponse,
     PreviewClearRequest,
     PreviewClearResponse,
+    PreviewDownloadRequest,
+    PreviewDownloadResponse,
+    PixelSizeUpdateRequest,
+    PixelSizeUpdateResponse,
     RatioUpdateRequest,
     RatioUpdateResponse,
     RunStatus,
@@ -48,6 +52,8 @@ from .services.studies import (
     resolve_preview_path,
     list_ratio_definitions,
     update_ratio_definitions,
+    update_pixel_size,
+    render_preview_panel,
 )
 from .services.uploads import UploadCategory, store_upload
 from .services.threshold_runner import describe_run, launch_threshold_run
@@ -102,6 +108,7 @@ def create_app() -> FastAPI:
             "nd2_root": str(record.input_dir),
             "nd2_available": record.input_dir.exists(),
             "ratio_definitions": record.ratio_definitions,
+            "pixel_size_um": record.pixel_size_um,
         }
 
     @app.get("/studies")
@@ -132,6 +139,10 @@ def create_app() -> FastAPI:
     async def preview_cache_clear_endpoint(study_id: str, request: PreviewClearRequest) -> PreviewClearResponse:
         return clear_preview_cache(study_id, request.scope, request.threshold_key)
 
+    @app.post("/studies/{study_id}/previews/render", response_model=PreviewDownloadResponse)
+    async def preview_render_endpoint(study_id: str, request: PreviewDownloadRequest) -> PreviewDownloadResponse:
+        return render_preview_panel(study_id, request)
+
     @app.post("/studies/{study_id}/downloads/current", response_model=DownloadResponse)
     async def download_endpoint(study_id: str, request: AnalyzeRequest) -> DownloadResponse:
         return generate_downloads(study_id, request.thresholds)
@@ -145,6 +156,11 @@ def create_app() -> FastAPI:
     async def update_ratio_defs(study_id: str, request: RatioUpdateRequest) -> RatioUpdateResponse:
         ratios = update_ratio_definitions(study_id, [entry.dict() for entry in request.ratios])
         return RatioUpdateResponse(ratios=ratios)
+
+    @app.post("/studies/{study_id}/pixel-size", response_model=PixelSizeUpdateResponse)
+    async def update_pixel_size_endpoint(study_id: str, request: PixelSizeUpdateRequest) -> PixelSizeUpdateResponse:
+        value = update_pixel_size(study_id, request.pixel_size_um)
+        return PixelSizeUpdateResponse(pixel_size_um=value)
 
     @app.get("/studies/{study_id}/preview-file")
     async def preview_file_endpoint(study_id: str, path: str) -> FileResponse:

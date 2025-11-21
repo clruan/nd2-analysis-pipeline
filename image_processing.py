@@ -4,7 +4,7 @@ import os
 import re
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple, List, Optional, Union, Any
+from typing import Dict, Tuple, List, Optional, Union, Any, Sequence
 from pathlib import Path
 import logging
 
@@ -16,6 +16,49 @@ from config import DEFAULT_THRESHOLDS, DEFAULT_MARKER, DEFAULT_MARKER_2D
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+def detect_pixel_size(filepath: str) -> Optional[float]:
+    """
+    Attempt to read the pixel-to-micrometer ratio from an ND2 file.
+
+    Args:
+        filepath: Path to an ND2 image.
+
+    Returns:
+        Detected pixel size in micrometers, or None if unavailable.
+    """
+    try:
+        with ND2Reader(filepath) as nd2:
+            pixel_size = getattr(nd2.metadata, "pixel_microns", None)
+            value = _extract_pixel_value(pixel_size)
+            if value is not None and value > 0:
+                return float(value)
+    except Exception as exc:
+        logger.debug(f"Could not read pixel size from {filepath}: {exc}")
+    try:
+        nd2 = Nd2(filepath)
+        pixel_size = getattr(nd2.metadata, "pixel_microns", None)
+        nd2.close()
+        value = _extract_pixel_value(pixel_size)
+        if value is not None and value > 0:
+            return float(value)
+    except Exception as exc:
+        logger.debug(f"Fallback pixel size read failed for {filepath}: {exc}")
+    return None
+
+
+def _extract_pixel_value(pixel_size: Optional[Union[Sequence[float], float]]) -> Optional[float]:
+    """Extract the first numeric value from pixel metadata."""
+    if pixel_size is None:
+        return None
+    if isinstance(pixel_size, (int, float)):
+        return float(pixel_size)
+    if isinstance(pixel_size, Sequence) and pixel_size:
+        try:
+            return float(pixel_size[0])
+        except (TypeError, ValueError):
+            return None
+    return None
 
 def get_nd2_files(directory: str) -> List[str]:
     """
