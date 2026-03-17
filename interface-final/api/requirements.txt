@@ -1,11 +1,15 @@
-#
 # Runtime dependencies for the Interface-Final FastAPI service.
-# This file intentionally vendors the shared scientific stack from the
-# root `requirements.txt` to keep the backend self-contained when the
-# interface is deployed independently.
-#
+# Keep this list focused on packages imported by the interface backend.
+# Do not include optional microscopy formats or test-only dependencies.
 
--r ../../requirements.txt
+numpy>=1.21.0,<2.0.0
+pandas>=1.3.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+scipy>=1.7.0
+joblib>=1.1.0
+nd2reader>=3.3.0
+pyclesperanto>=0.18.0
 
 fastapi>=0.111.0,<0.116.0
 uvicorn[standard]>=0.26.0,<0.31.0

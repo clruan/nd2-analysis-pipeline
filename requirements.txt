@@ -18,6 +18,8 @@ openpyxl>=3.0.9
 
 # Optional: For enhanced image processing
 scikit-image>=0.19.0
+aicsimageio>=4.14.0
+aicspylibczi>=3.2.1
 
 # Optional: For statistical analysis
 scipy>=1.7.0

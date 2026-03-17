@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { devtools } from "zustand/middleware";
-import type { LoadedStudy, RatioDefinition } from "../api/types";
-import { DEFAULT_RATIO_DEFINITIONS } from "../constants/metrics";
+import type { ChannelDefinition, LoadedStudy, RatioDefinition } from "../api/types";
+import { DEFAULT_CHANNEL_DEFINITIONS, DEFAULT_RATIO_DEFINITIONS, normalizeChannelDefinitions } from "../constants/metrics";
 
 type ThresholdMap = Record<string, number>;
 type ChannelId = "channel_1" | "channel_2" | "channel_3";
@@ -32,18 +32,22 @@ interface PlotSettings {
 interface AppState {
   study: LoadedStudy | null;
   thresholds: ThresholdMap;
+  thresholdControlHovered: boolean;
   statisticsEnabled: boolean;
   statisticsSettings: StatisticsSettings;
   selectedMetric: string;
   plotSettings: PlotSettings;
   previewSamplesPerGroup: number;
   ratioDefinitions: RatioDefinition[];
+  channelDefinitions: ChannelDefinition[];
   previewGroupOverrides: Record<string, number>;
   previewChannelRanges: Record<ChannelId, ChannelRangeTuple>;
   previewPanelOrder: PanelId[];
+  previewScaleBarEnabled: boolean;
   setStudy: (study: LoadedStudy | null) => void;
   setThreshold: (channel: string, value: number) => void;
   setThresholds: (values: ThresholdMap) => void;
+  setThresholdControlHovered: (value: boolean) => void;
   setStatisticsEnabled: (value: boolean) => void;
   setSelectedMetric: (metricId: string) => void;
   setComparisonMode: (mode: ComparisonMode) => void;
@@ -65,7 +69,9 @@ interface AppState {
   resetPreviewChannelRanges: () => void;
   setPreviewPanelOrder: (order: PanelId[]) => void;
   resetPreviewPanelOrder: () => void;
+  setPreviewScaleBarEnabled: (value: boolean) => void;
   setRatioDefinitions: (ratios: RatioDefinition[]) => void;
+  setChannelDefinitions: (channels: ChannelDefinition[]) => void;
   setPreviewGroupOverride: (group: string, value: number | null) => void;
   resetPreviewGroupOverrides: () => void;
   updateStudy: (update: Partial<LoadedStudy>) => void;
@@ -113,31 +119,43 @@ export const useAppStore = create<AppState>()(
   devtools((set) => ({
     study: null,
     thresholds: defaultThresholds,
+    thresholdControlHovered: false,
     statisticsEnabled: false,
     statisticsSettings: createDefaultStatisticsSettings(),
     selectedMetric: defaultSelectedMetric,
     plotSettings: defaultPlotSettings(),
-    previewSamplesPerGroup: 1,
+    previewSamplesPerGroup: 4,
     ratioDefinitions: DEFAULT_RATIO_DEFINITIONS,
+    channelDefinitions: DEFAULT_CHANNEL_DEFINITIONS,
     previewGroupOverrides: {},
     previewChannelRanges: createDefaultChannelRanges(),
     previewPanelOrder: [...defaultPanelOrder],
+    previewScaleBarEnabled: true,
     setStudy: (study) =>
       set(() => ({
         study,
+        thresholdControlHovered: false,
         statisticsEnabled: false,
         statisticsSettings: createDefaultStatisticsSettings(),
         selectedMetric: defaultSelectedMetric,
         plotSettings: defaultPlotSettings(),
-        previewSamplesPerGroup: 1,
+        previewSamplesPerGroup: 4,
         ratioDefinitions: study?.ratio_definitions ?? DEFAULT_RATIO_DEFINITIONS,
+        channelDefinitions: normalizeChannelDefinitions(study?.channel_definitions),
         previewGroupOverrides: {},
         previewChannelRanges: createDefaultChannelRanges(),
-        previewPanelOrder: [...defaultPanelOrder]
+        previewPanelOrder: [...defaultPanelOrder],
+        previewScaleBarEnabled: true
       })),
     setThreshold: (channel, value) =>
-      set((state) => ({ thresholds: { ...state.thresholds, [channel]: value } })),
+      set((state) => {
+        if (state.thresholds[channel] === value) {
+          return state;
+        }
+        return { thresholds: { ...state.thresholds, [channel]: value } };
+      }),
     setThresholds: (values) => set({ thresholds: { ...defaultThresholds, ...values } }),
+    setThresholdControlHovered: (value) => set({ thresholdControlHovered: value }),
     setStatisticsEnabled: (value) => set({ statisticsEnabled: value }),
     setSelectedMetric: (metricId) => set({ selectedMetric: metricId }),
     setComparisonMode: (mode) =>
@@ -264,7 +282,7 @@ export const useAppStore = create<AppState>()(
       })),
     setPreviewSamplesPerGroup: (value) =>
       set(() => ({
-        previewSamplesPerGroup: Math.max(1, Math.min(6, Math.round(value)))
+        previewSamplesPerGroup: Math.max(1, Math.min(20, Math.round(value)))
       })),
     setPreviewChannelRange: (channel, range) =>
       set((state) => {
@@ -272,6 +290,10 @@ export const useAppStore = create<AppState>()(
         const min = Math.max(0, Math.min(4095, Math.min(rawMin, rawMax)));
         const max = Math.max(0, Math.min(4095, Math.max(rawMin, rawMax)));
         const adjusted: ChannelRangeTuple = min === max ? [min, min + 1] : [min, max];
+        const current = state.previewChannelRanges[channel];
+        if (current[0] === adjusted[0] && current[1] === adjusted[1]) {
+          return state;
+        }
         return {
           previewChannelRanges: {
             ...state.previewChannelRanges,
@@ -298,9 +320,17 @@ export const useAppStore = create<AppState>()(
       set(() => ({
         previewPanelOrder: [...defaultPanelOrder]
       })),
+    setPreviewScaleBarEnabled: (value) =>
+      set(() => ({
+        previewScaleBarEnabled: value
+      })),
     setRatioDefinitions: (ratios) =>
       set(() => ({
         ratioDefinitions: ratios.length ? ratios : DEFAULT_RATIO_DEFINITIONS
+      })),
+    setChannelDefinitions: (channels) =>
+      set(() => ({
+        channelDefinitions: normalizeChannelDefinitions(channels)
       })),
     setPreviewGroupOverride: (group, value) =>
       set((state) => {

@@ -1,4 +1,4 @@
-"""Generate threshold analysis data from ND2 files."""
+"""Generate threshold analysis data from microscopy files."""
 
 import numpy as np
 import logging
@@ -6,11 +6,34 @@ from typing import Dict, Optional
 from pathlib import Path
 
 # Import from existing pipeline (no changes to existing code)
+from config import DEFAULT_MARKER, DEFAULT_MARKER_2D
 from image_processing import load_nd2_file, parse_mouse_id
 from data_models import GroupConfig
 from .data_models import ThresholdData
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_threshold_percentages(channel_data: np.ndarray, max_threshold: int) -> np.ndarray:
+    """Compute positive-pixel percentages for every threshold in one pass."""
+    flattened = np.asarray(channel_data, dtype=np.float32).reshape(-1)
+    if flattened.size == 0:
+        return np.zeros(max_threshold + 1, dtype=np.float32)
+
+    # A value contributes to threshold t when value > t. Ceil keeps that
+    # relation intact for non-integer microscope intensities.
+    quantized = np.ceil(flattened).astype(np.int32, copy=False)
+    clipped = np.clip(quantized, 0, max_threshold)
+    histogram = np.bincount(clipped, minlength=max_threshold + 1)
+    above_max = int(np.count_nonzero(quantized > max_threshold))
+
+    greater_than = np.zeros(max_threshold + 1, dtype=np.float64)
+    if max_threshold > 0:
+        cumulative = np.cumsum(histogram[::-1], dtype=np.int64)[::-1]
+        greater_than[:-1] = cumulative[1:]
+    greater_than += above_max
+
+    return ((greater_than / flattened.size) * 100.0).astype(np.float32, copy=False)
 
 def analyze_single_image_all_thresholds(
     filepath: str,
@@ -25,7 +48,7 @@ def analyze_single_image_all_thresholds(
     MINIMAL IMPLEMENTATION: Focus on core functionality only.
     
     Args:
-        filepath: Path to ND2 file
+        filepath: Path to source image file
         mouse_lookup: Dictionary mapping mouse IDs to groups
         is_3d: Whether file contains 3D data
         marker: Filename marker for mouse ID extraction
@@ -36,8 +59,11 @@ def analyze_single_image_all_thresholds(
     """
     try:
         # Reuse existing functions - NO CHANGES to existing pipeline
-        # Use existing pipeline's default marker logic
-        mouse_id = parse_mouse_id(filepath, marker)
+        # Use existing pipeline's default marker logic and direct ID matching
+        if marker is None:
+            marker = DEFAULT_MARKER if is_3d else DEFAULT_MARKER_2D
+        known_mouse_ids = list(mouse_lookup.keys())
+        mouse_id = parse_mouse_id(filepath, marker, known_mouse_ids)
         
         if mouse_id not in mouse_lookup:
             logger.warning(f"Mouse ID {mouse_id} not found in groups")
@@ -47,23 +73,9 @@ def analyze_single_image_all_thresholds(
         
         # Load image data using existing function
         channel_1, channel_2, channel_3 = load_nd2_file(filepath, is_3d)
-        total_pixels = channel_1.shape[0] * channel_1.shape[1]
-        
-        # Pre-allocate arrays for all thresholds
-        ch1_percentages = np.zeros(max_threshold + 1)
-        ch2_percentages = np.zeros(max_threshold + 1)  
-        ch3_percentages = np.zeros(max_threshold + 1)
-        
-        # Calculate positive pixel percentages for each threshold
-        # MINIMAL: Simple numpy operations, no GPU acceleration yet
-        for threshold in range(max_threshold + 1):
-            ch1_positive = np.sum(channel_1 > threshold)
-            ch2_positive = np.sum(channel_2 > threshold)
-            ch3_positive = np.sum(channel_3 > threshold)
-            
-            ch1_percentages[threshold] = (ch1_positive / total_pixels) * 100
-            ch2_percentages[threshold] = (ch2_positive / total_pixels) * 100
-            ch3_percentages[threshold] = (ch3_positive / total_pixels) * 100
+        ch1_percentages = _compute_threshold_percentages(channel_1, max_threshold)
+        ch2_percentages = _compute_threshold_percentages(channel_2, max_threshold)
+        ch3_percentages = _compute_threshold_percentages(channel_3, max_threshold)
         
         return ThresholdData(
             mouse_id=mouse_id,

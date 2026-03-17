@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import PlotlyChart from "./PlotlyChart";
 import type { PlotHoverEvent, Shape, Annotations, PlotlyHTMLElement, DownloadImgopts } from "plotly.js";
 import { Alert, Box, Button, CircularProgress, Stack, Typography } from "@mui/material";
@@ -6,8 +6,9 @@ import { apiClient } from "../api/client";
 import { useAnalysisQuery, useDownloadMutation, useStatisticsQuery } from "../api/hooks";
 import { useAppStore } from "../state/useAppStore";
 import { useThresholds } from "../hooks/useThresholds";
-import type { IndividualImageRecord, MouseAverageRecord } from "../api/types";
-import { CHANNEL_METRICS } from "../constants/metrics";
+import { thresholdsEqual, useThresholdMotion } from "../hooks/useThresholdMotion";
+import type { IndividualImageRecord, MouseAverageRecord, StatisticsResponse } from "../api/types";
+import { CHANNEL_METRICS, normalizeChannelDefinitions } from "../constants/metrics";
 import DownloadIcon from "@mui/icons-material/FileDownloadOutlined";
 
 type MetricDescriptor = {
@@ -44,6 +45,7 @@ interface SamplePoint {
 }
 
 interface ReplicatePoint {
+  id: string;
   value: number;
   label: string;
 }
@@ -51,7 +53,15 @@ interface ReplicatePoint {
 interface HoverState {
   metricId: string;
   subjectKey: string;
-  groupIndex: number;
+}
+
+interface HoverTooltipState {
+  metricId: string;
+  left: number;
+  top: number;
+  title: string;
+  details: string[];
+  accentColor: string;
 }
 
 type PlotlyModule = typeof import("plotly.js");
@@ -120,6 +130,10 @@ const formatPValue = (value: number) => {
   return value.toFixed(3);
 };
 
+const formatMetricValue = (value: number) => (Number.isFinite(value) ? value.toFixed(2) : "n/a");
+
+const clampToRange = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
 function listGroups(mouseAverages: Array<{ Group: string }>): string[] {
   const unique = new Set<string>();
   mouseAverages.forEach((row) => unique.add(row.Group));
@@ -134,6 +148,20 @@ function buildColorMap(base: Record<string, string>, groups: string[]): Record<s
     }
   });
   return palette;
+}
+
+function collectMetricValues(
+  metric: MetricDescriptor,
+  mouseAverages: MouseAverageRecord[],
+  individualImages: IndividualImageRecord[]
+): number[] {
+  const subjectValues = mouseAverages
+    .map((record) => metric.valueAccessor(record))
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  const replicateValues = individualImages
+    .map((record) => metric.replicateAccessor(record))
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  return [...subjectValues, ...replicateValues];
 }
 
 function buildReplicateLookup(
@@ -152,19 +180,30 @@ function buildReplicateLookup(
       }
       const key = `${record.group}|${record.mouse_id}`;
       const bucket = map[metric.id].get(key) ?? [];
-      bucket.push({ value: raw, label: `${record.filename} (rep ${record.replicate_index})` });
+      bucket.push({
+        id: `${record.filename}|${record.replicate_index}`,
+        value: raw,
+        label: `${record.filename} (rep ${record.replicate_index})`
+      });
       map[metric.id].set(key, bucket);
     });
   });
   return map;
 }
 
-const deterministicOffset = (index: number, width: number) => {
+const hashString = (value: string) => {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+};
+
+const deterministicKeyOffset = (key: string, width: number) => {
   if (width <= 0) {
     return 0;
   }
-  const phi = 0.61803398875;
-  const fraction = ((index + 1) * phi) % 1;
+  const fraction = (hashString(key) % 10000) / 9999;
   return (fraction - 0.5) * 2 * width;
 };
 
@@ -258,7 +297,9 @@ export default function AnalysisBoard() {
     selectedMetric,
     setSelectedMetric,
     plotSettings,
-    ratioDefinitions
+    ratioDefinitions,
+    channelDefinitions,
+    thresholdControlHovered
   } = useAppStore((state) => ({
     study: state.study,
     thresholds: state.thresholds,
@@ -267,17 +308,30 @@ export default function AnalysisBoard() {
     selectedMetric: state.selectedMetric,
     setSelectedMetric: state.setSelectedMetric,
     plotSettings: state.plotSettings,
-    ratioDefinitions: state.ratioDefinitions
+    ratioDefinitions: state.ratioDefinitions,
+    channelDefinitions: state.channelDefinitions,
+    thresholdControlHovered: state.thresholdControlHovered
   }));
 
   const { debounced } = useThresholds();
+  const normalizedChannels = useMemo(() => normalizeChannelDefinitions(channelDefinitions), [channelDefinitions]);
+  const channelLabelMap = useMemo(
+    () =>
+      normalizedChannels.reduce<Record<number, string>>((acc, definition) => {
+        acc[definition.channel] = definition.label;
+        return acc;
+      }, {}),
+    [normalizedChannels]
+  );
+
   const metrics = useMemo<MetricDescriptor[]>(() => {
     const base = CHANNEL_METRICS.map((metric) => {
       const mouseKey = `Channel_${metric.channel}_area` as keyof MouseAverageRecord;
       const replicateKey = `channel_${metric.channel}_area` as keyof IndividualImageRecord;
+      const channelLabel = channelLabelMap[metric.channel] ?? `Channel ${metric.channel}`;
       return {
         id: metric.id,
-        label: metric.label,
+        label: `${channelLabel} Positive Signal (%)`,
         statsKey: `channel_${metric.channel}`,
         valueAccessor: (record: MouseAverageRecord) => {
           const raw = record[mouseKey];
@@ -297,7 +351,7 @@ export default function AnalysisBoard() {
       replicateAccessor: (record: IndividualImageRecord) => record.ratios?.[ratio.id] ?? null
     }));
     return [...base, ...ratioMetrics];
-  }, [ratioDefinitions]);
+  }, [channelLabelMap, ratioDefinitions]);
 
   const analysisQuery = useAnalysisQuery(study?.study_id ?? null, debounced);
 
@@ -319,9 +373,53 @@ export default function AnalysisBoard() {
 
   const downloadMutation = useDownloadMutation(study?.study_id ?? null);
 
+  const thresholdMotion = useThresholdMotion(analysisQuery.data);
+  const displayedAnalysis = thresholdMotion.displayData ?? analysisQuery.data;
   const [hoverState, setHoverState] = useState<HoverState | null>(null);
+  const [tooltipState, setTooltipState] = useState<HoverTooltipState | null>(null);
   const plotRefs = useRef<Record<string, PlotlyHTMLElement | null>>({});
+  const hoverClearTimeoutRef = useRef<number | null>(null);
   const [exportingPlot, setExportingPlot] = useState<string | null>(null);
+  const frozenStatisticsRef = useRef<StatisticsResponse | undefined>(statisticsQuery.data);
+  const previousMotionActiveRef = useRef(false);
+
+  useEffect(() => {
+    return () => {
+      if (hoverClearTimeoutRef.current !== null) {
+        window.clearTimeout(hoverClearTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (thresholdMotion.active && !previousMotionActiveRef.current) {
+      frozenStatisticsRef.current = statisticsQuery.data ?? frozenStatisticsRef.current;
+    }
+    if (!thresholdMotion.active && statisticsQuery.data) {
+      frozenStatisticsRef.current = statisticsQuery.data;
+    }
+    previousMotionActiveRef.current = thresholdMotion.active;
+  }, [thresholdMotion.active, statisticsQuery.data]);
+
+  const mouseAverages = displayedAnalysis?.mouse_averages ?? [];
+  const individualImages = displayedAnalysis?.individual_images ?? [];
+
+  const groupNames = listGroups(mouseAverages);
+  const colorMap = buildColorMap(plotSettings.palette, groupNames);
+  const replicateLookup = buildReplicateLookup(individualImages, metrics);
+  const jitterWidth = plotSettings.jitterEnabled ? plotSettings.jitterWidth : 0;
+  const isUpdatingMetrics = analysisQuery.isFetching || statisticsQuery.isFetching;
+  const targetThresholds = thresholdMotion.toData?.thresholds ?? analysisQuery.data?.thresholds ?? thresholds;
+  const statisticsAreCurrent =
+    Boolean(statisticsQuery.data) &&
+    thresholdsEqual((statisticsQuery.data as StatisticsResponse).thresholds, targetThresholds);
+  const displayedStatistics =
+    thresholdMotion.active && (thresholdMotion.stage.subjectProgress < 0.92 || !statisticsAreCurrent)
+      ? frozenStatisticsRef.current ?? statisticsQuery.data
+      : statisticsQuery.data;
+
+  const statisticsNote =
+    statisticsEnabled && statisticsSettings.comparisonMode === "pairs" && statisticsSettings.comparisonPairs.length === 0;
 
   if (!study) {
     return (
@@ -348,42 +446,123 @@ export default function AnalysisBoard() {
     return <Alert severity="error">Unable to fetch analysis results.</Alert>;
   }
 
-  const mouseAverages = analysisQuery.data.mouse_averages;
-  const individualImages = analysisQuery.data.individual_images;
+  const scheduleHoverClear = () => {
+    if (hoverClearTimeoutRef.current !== null) {
+      window.clearTimeout(hoverClearTimeoutRef.current);
+    }
+    hoverClearTimeoutRef.current = window.setTimeout(() => {
+      setHoverState(null);
+      setTooltipState(null);
+      hoverClearTimeoutRef.current = null;
+    }, 160);
+  };
 
-  const groupNames = listGroups(mouseAverages);
-  const colorMap = buildColorMap(plotSettings.palette, groupNames);
-  const replicateLookup = buildReplicateLookup(individualImages, metrics);
-  const jitterWidth = plotSettings.jitterEnabled ? plotSettings.jitterWidth : 0;
+  const buildTooltipPosition = (metricId: string, event: MouseEvent) => {
+    const graphDiv = plotRefs.current[metricId];
+    if (!graphDiv) {
+      return null;
+    }
+    const rect = graphDiv.getBoundingClientRect();
+    const maxLeft = Math.max(16, rect.width - 232);
+    const maxTop = Math.max(16, rect.height - 112);
+    const preferredLeft = event.clientX - rect.left + 28;
+    const preferredTop = event.clientY - rect.top - 64;
+    const fallbackTop = event.clientY - rect.top + 28;
+    return {
+      left: clampToRange(preferredLeft, 16, maxLeft),
+      top: clampToRange(preferredTop < 16 ? fallbackTop : preferredTop, 16, maxTop)
+    };
+  };
 
-  const statisticsNote =
-    statisticsEnabled && statisticsSettings.comparisonMode === "pairs" && statisticsSettings.comparisonPairs.length === 0;
-
-  const handleHover = (metricId: string, indexByGroup: Map<string, number>, event: Readonly<PlotHoverEvent>) => {
+  const handleHover = (metricId: string, event: Readonly<PlotHoverEvent>) => {
+    if (hoverClearTimeoutRef.current !== null) {
+      window.clearTimeout(hoverClearTimeoutRef.current);
+      hoverClearTimeoutRef.current = null;
+    }
     const point = event.points?.[0];
-    if (!point || point.data.name !== "Subjects") {
-      setHoverState(null);
+    if (!point) {
+      scheduleHoverClear();
       return;
     }
-    const raw = point.customdata as unknown;
-    if (!Array.isArray(raw) || raw.length < 2) {
+    const tooltipPosition = buildTooltipPosition(metricId, event.event);
+    const traceName = String(point.data?.name ?? "");
+    if (traceName === "Group mean" && tooltipPosition) {
+      const raw = point.customdata as unknown;
+      const group = Array.isArray(raw) && raw.length > 0 ? String(raw[0]) : String(point.x ?? "");
+      const sd = Array.isArray(raw) && typeof raw[1] === "number" ? raw[1] : null;
+      const count = Array.isArray(raw) && typeof raw[2] === "number" ? raw[2] : null;
       setHoverState(null);
+      setTooltipState({
+        metricId,
+        ...tooltipPosition,
+        title: group,
+        details: [`Mean: ${formatMetricValue(Number(point.y))}`, `SD: ${formatMetricValue(sd ?? Number.NaN)}`, `n = ${count ?? "n/a"}`],
+        accentColor: colorMap[group] ?? "#0f172a"
+      });
       return;
     }
-    const group = String(raw[0]);
-    const mouseId = String(raw[1]);
-    const groupIndex = typeof raw[2] === "number" && Number.isFinite(raw[2]) ? (raw[2] as number) : indexByGroup.get(group) ?? 0;
-    const subjectKey = `${group}|${mouseId}`;
-    const replicates = replicateLookup[metricId]?.get(subjectKey);
-    if (!replicates || replicates.length === 0) {
-      setHoverState(null);
+    if (traceName === "Subjects") {
+      const raw = point.customdata as unknown;
+      if (!Array.isArray(raw) || raw.length < 2) {
+        scheduleHoverClear();
+        return;
+      }
+      const group = String(raw[0]);
+      const mouseId = String(raw[1]);
+      const subjectKey = `${group}|${mouseId}`;
+      const replicates = replicateLookup[metricId]?.get(subjectKey);
+      if (replicates && replicates.length > 0) {
+        setHoverState({ metricId, subjectKey });
+      } else {
+        setHoverState(null);
+      }
+      if (tooltipPosition) {
+        setTooltipState({
+          metricId,
+          ...tooltipPosition,
+          title: `${group} • ${mouseId}`,
+          details: [
+            `Subject value: ${formatMetricValue(Number(point.y))}`,
+            `${replicates?.length ?? 0} replica${replicates && replicates.length === 1 ? "" : "s"}`
+          ],
+          accentColor: colorMap[group] ?? "#0f172a"
+        });
+      }
       return;
     }
-    setHoverState({ metricId, subjectKey, groupIndex });
+    if (traceName === "Replicates") {
+      const raw = point.customdata as unknown;
+      if (Array.isArray(raw) && raw.length >= 4) {
+        const subjectKey = String(raw[0]);
+        const group = String(raw[1]);
+        const mouseId = String(raw[2]);
+        const label = String(raw[3]);
+        setHoverState({ metricId, subjectKey });
+        if (tooltipPosition) {
+          setTooltipState({
+            metricId,
+            ...tooltipPosition,
+            title: `${group} • ${mouseId}`,
+            details: [label, `Replica value: ${formatMetricValue(Number(point.y))}`],
+            accentColor: colorMap[group] ?? "#94a3b8"
+          });
+        }
+        return;
+      }
+    }
+    if (traceName === "Replica hover region") {
+      const raw = point.customdata as unknown;
+      const subjectKey = Array.isArray(raw) ? raw[0] : raw;
+      if (typeof subjectKey === "string" && subjectKey) {
+        setHoverState({ metricId, subjectKey });
+        return;
+      }
+    }
+    scheduleHoverClear();
   };
 
   const handleUnhover = () => {
-    setHoverState(null);
+    scheduleHoverClear();
   };
 
   const registerPlotHandle =
@@ -402,7 +581,7 @@ export default function AnalysisBoard() {
       const plotlyModule = await import("plotly.js-dist-min");
       const plotlyLib = (plotlyModule.default ?? plotlyModule) as PlotlyModule;
       const filenameParts = [
-        (study.study_name || "nd2-study").replace(/\s+/g, "_"),
+        (study.study_name || "microscopy-study").replace(/\s+/g, "_"),
         metricId,
         `${thresholds.channel_1}-${thresholds.channel_2}-${thresholds.channel_3}`
       ];
@@ -430,8 +609,13 @@ export default function AnalysisBoard() {
             {study.study_name}
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            {groupNames.length} groups • thresholds: Ch1 {thresholds.channel_1} | Ch2 {thresholds.channel_2} | Ch3 {thresholds.channel_3}
+            {groupNames.length} groups • thresholds: {(channelLabelMap[1] ?? "Ch1")} {thresholds.channel_1} | {(channelLabelMap[2] ?? "Ch2")} {thresholds.channel_2} | {(channelLabelMap[3] ?? "Ch3")} {thresholds.channel_3}
           </Typography>
+          {isUpdatingMetrics && (
+            <Typography variant="caption" color="text.secondary" display="block">
+              Updating threshold metrics…
+            </Typography>
+          )}
         </Box>
         <Button
           variant="outlined"
@@ -501,38 +685,76 @@ export default function AnalysisBoard() {
 
         const groupIndices = grouped.map((_, index) => index);
         const groupMeans = grouped.map((entry) => entry.mean);
-        const sampleValues = grouped.flatMap((entry) => entry.samples.map((sample) => sample.value));
-        const replicateBuckets = replicateLookup[metric.id];
-        const replicateValues = replicateBuckets
-          ? Array.from(replicateBuckets.values()).flatMap((entries) => entries.map((replicate) => replicate.value))
-          : [];
-        const axisCandidates = [...groupMeans, ...sampleValues, ...replicateValues].filter((value) =>
-          Number.isFinite(value)
-        );
+        const axisCandidates = [
+          ...collectMetricValues(metric, mouseAverages, individualImages),
+          ...(thresholdMotion.active && thresholdMotion.fromData
+            ? collectMetricValues(metric, thresholdMotion.fromData.mouse_averages, thresholdMotion.fromData.individual_images)
+            : []),
+          ...(thresholdMotion.active && thresholdMotion.toData
+            ? collectMetricValues(metric, thresholdMotion.toData.mouse_averages, thresholdMotion.toData.individual_images)
+            : [])
+        ].filter((value) => Number.isFinite(value));
+        const baseMin = axisCandidates.length > 0 ? Math.min(...axisCandidates) : 0;
         const baseMax = axisCandidates.length > 0 ? Math.max(...axisCandidates) : 0;
 
-        const statBlock = statisticsEnabled && statisticsQuery.data
+        const statBlock = statisticsEnabled && displayedStatistics
+          ? (displayedStatistics.statistics?.[metric.statsKey as keyof typeof displayedStatistics.statistics] as StatisticalBlock | undefined)
+          : undefined;
+        const frozenStatBlock = statisticsEnabled && frozenStatisticsRef.current
+          ? (frozenStatisticsRef.current.statistics?.[
+              metric.statsKey as keyof typeof frozenStatisticsRef.current.statistics
+            ] as StatisticalBlock | undefined)
+          : undefined;
+        const latestStatBlock = statisticsEnabled && statisticsQuery.data
           ? (statisticsQuery.data.statistics?.[metric.statsKey as keyof typeof statisticsQuery.data.statistics] as StatisticalBlock | undefined)
           : undefined;
 
-        const { shapes, annotations, maxY } = buildSignificanceLayers(
+        const displayedLayers = buildSignificanceLayers(
           statBlock?.pairwise_comparisons,
           indexByGroup,
           baseMax
         );
+        const frozenLayers = buildSignificanceLayers(
+          frozenStatBlock?.pairwise_comparisons,
+          indexByGroup,
+          baseMax
+        );
+        const latestLayers = buildSignificanceLayers(
+          latestStatBlock?.pairwise_comparisons,
+          indexByGroup,
+          baseMax
+        );
+        const { shapes, annotations } = displayedLayers;
+        const significanceUpper = Math.max(displayedLayers.maxY, frozenLayers.maxY, latestLayers.maxY, baseMax || 1);
+        const lowerCandidate = baseMin < 0 ? baseMin : 0;
+        const ySpan = Math.max(significanceUpper - lowerCandidate, 1);
+        const yLower = baseMin < 0 ? lowerCandidate - ySpan * 0.08 : 0;
+        const yUpper = significanceUpper + ySpan * 0.06;
 
         const samplesX: number[] = [];
         const samplesY: number[] = [];
         const samplesText: string[] = [];
         const samplesCustom: [string, string, number][] = [];
+        const subjectPointMap = new Map<string, { x: number; y: number; group: string; mouseId: string }>();
+        const subjectJitterWidth = jitterWidth;
 
         grouped.forEach((entry, groupIndex) => {
-          entry.samples.forEach((sample, sampleIndex) => {
-            const offset = deterministicOffset(sampleIndex, jitterWidth);
-            samplesX.push(groupIndex + offset);
+          entry.samples
+            .slice()
+            .sort((first, second) => first.mouseId.localeCompare(second.mouseId, undefined, { numeric: true, sensitivity: "base" }))
+            .forEach((sample) => {
+            const subjectKey = `${entry.group}|${sample.mouseId}`;
+            const x = groupIndex + deterministicKeyOffset(subjectKey, subjectJitterWidth);
+            samplesX.push(x);
             samplesY.push(sample.value);
             samplesText.push(`${entry.group} • ${sample.mouseId}: ${sample.value.toFixed(2)}`);
             samplesCustom.push([entry.group, sample.mouseId, groupIndex]);
+            subjectPointMap.set(subjectKey, {
+              x,
+              y: sample.value,
+              group: entry.group,
+              mouseId: sample.mouseId
+            });
           });
         });
 
@@ -556,7 +778,7 @@ export default function AnalysisBoard() {
         };
 
         const scatterTrace = {
-          type: "scatter" as const,
+          type: "scattergl" as const,
           mode: "markers" as const,
           x: samplesX,
           y: samplesY,
@@ -573,40 +795,127 @@ export default function AnalysisBoard() {
           showlegend: false
         };
 
-        let replicateTrace = null;
-        if (hoverState && hoverState.metricId === metric.id) {
-          const replicates = replicateLookup[metric.id]?.get(hoverState.subjectKey);
-          if (replicates && replicates.length > 0) {
-            const baseIndex = hoverState.groupIndex;
-            const overlayWidth = jitterWidth > 0 ? jitterWidth * 0.6 : 0.12;
-            const repX: number[] = [];
-            const repY: number[] = [];
-            const repText: string[] = [];
-            replicates.forEach((replicate, replicateIndex) => {
-              const offset = deterministicOffset(replicateIndex, overlayWidth);
-              repX.push(baseIndex + offset);
-              repY.push(replicate.value);
-              repText.push(`${replicate.label}\n${replicate.value.toFixed(2)}`);
-            });
-            replicateTrace = {
-              type: "scatter" as const,
-              mode: "markers" as const,
-              x: repX,
-              y: repY,
-              text: repText,
-              marker: {
-                color: "#64748b",
-                size: 7,
-                opacity: 0.85
-              },
-              hovertemplate: "%{text}<extra></extra>",
-              name: "Replicates",
-              showlegend: false
-            };
-          }
-        }
+        const revealAllReplicates =
+          thresholdControlHovered || (thresholdMotion.active && thresholdMotion.stage.replicaVisibility > 0.001);
+        const showReplicaLinks = revealAllReplicates || (hoverState !== null && hoverState.metricId === metric.id);
+        const revealedSubjectKeys = revealAllReplicates
+          ? Array.from(subjectPointMap.keys())
+          : hoverState && hoverState.metricId === metric.id
+            ? [hoverState.subjectKey]
+            : [];
 
-        const data = replicateTrace ? [barTrace, scatterTrace, replicateTrace] : [barTrace, scatterTrace];
+        const replicateLinkX: Array<number | null> = [];
+        const replicateLinkY: Array<number | null> = [];
+        const repX: number[] = [];
+        const repY: number[] = [];
+        const repText: string[] = [];
+        const repCustom: Array<[string, string, string, string]> = [];
+        const replicaHoverX: number[] = [];
+        const replicaHoverY: number[] = [];
+        const replicaHoverCustom: string[] = [];
+
+        revealedSubjectKeys.forEach((subjectKey) => {
+          const subjectPoint = subjectPointMap.get(subjectKey);
+          const replicates = replicateLookup[metric.id]?.get(subjectKey);
+          if (!subjectPoint || !replicates || replicates.length === 0) {
+            return;
+          }
+          const overlayWidth = Math.max(subjectJitterWidth * 0.55, 0.12);
+          if (!revealAllReplicates) {
+            replicaHoverX.push(subjectPoint.x);
+            replicaHoverY.push(subjectPoint.y);
+            replicaHoverCustom.push(subjectKey);
+          }
+          replicates.forEach((replicate) => {
+            const repXValue = subjectPoint.x + deterministicKeyOffset(`${subjectKey}|${replicate.id}`, overlayWidth);
+            repX.push(repXValue);
+            repY.push(replicate.value);
+            repText.push(
+              `${subjectPoint.group} • ${subjectPoint.mouseId}\n${replicate.label}\n${replicate.value.toFixed(2)}`
+            );
+            repCustom.push([subjectKey, subjectPoint.group, subjectPoint.mouseId, replicate.label]);
+            if (showReplicaLinks) {
+              replicateLinkX.push(subjectPoint.x, repXValue, null);
+              replicateLinkY.push(subjectPoint.y, replicate.value, null);
+            }
+            if (!revealAllReplicates) {
+              replicaHoverX.push(repXValue, (subjectPoint.x + repXValue) / 2);
+              replicaHoverY.push(replicate.value, (subjectPoint.y + replicate.value) / 2);
+              replicaHoverCustom.push(subjectKey, subjectKey);
+            }
+          });
+        });
+
+        const linkOpacity = revealAllReplicates
+          ? thresholdMotion.active
+            ? 0.16 + thresholdMotion.stage.replicaVisibility * 0.26
+            : 0.34
+          : 0.28;
+
+        const replicateLinkTrace =
+          replicateLinkX.length > 0
+            ? {
+                type: "scattergl" as const,
+                mode: "lines" as const,
+                x: replicateLinkX,
+                y: replicateLinkY,
+                line: {
+                  color: `rgba(15,23,42,${linkOpacity.toFixed(3)})`,
+                  width: revealAllReplicates ? 1.1 : 1.25
+                },
+                hoverinfo: "skip" as const,
+                name: "Replica links",
+                showlegend: false
+              }
+            : null;
+
+        const replicateTrace =
+          repX.length > 0
+            ? {
+                type: "scattergl" as const,
+                mode: "markers" as const,
+                x: repX,
+                y: repY,
+                text: repText,
+                customdata: repCustom,
+                marker: {
+                  color: "#94a3b8",
+                  size: revealAllReplicates ? 5.2 + thresholdMotion.stage.replicaVisibility * 1.8 : 6.4,
+                  opacity: revealAllReplicates ? 0.74 * thresholdMotion.stage.replicaVisibility : 0.88,
+                  line: { color: "#ffffff", width: 0.6 }
+                },
+                hovertemplate: "%{text}<extra></extra>",
+                name: "Replicates",
+                showlegend: false
+              }
+            : null;
+
+        const replicaHoverTrace =
+          replicaHoverX.length > 0
+            ? {
+                type: "scattergl" as const,
+                mode: "markers" as const,
+                x: replicaHoverX,
+                y: replicaHoverY,
+                customdata: replicaHoverCustom,
+                marker: {
+                  size: 22,
+                  color: "rgba(148,163,184,0.001)",
+                  line: { width: 0 }
+                },
+                hovertemplate: "<extra></extra>",
+                name: "Replica hover region",
+                showlegend: false
+              }
+            : null;
+
+        const data = [
+          barTrace,
+          replicateLinkTrace,
+          replicateTrace,
+          replicaHoverTrace,
+          scatterTrace
+        ].filter(Boolean);
 
         const overallTest = statBlock?.overall_test ?? null;
         const overallSummary =
@@ -675,46 +984,90 @@ export default function AnalysisBoard() {
                   {overallSummary}
                 </Typography>
               )}
-              <PlotlyChart
-                data={data}
-                layout={{
-                  ...baseLayout,
-                  font: { ...baseLayout.font, size: plotSettings.fontSize },
-                  margin: { ...baseLayout.margin, t: 40 },
-                  dragmode: "pan",
-                  xaxis: {
-                    ...baseLayout.xaxis,
-                    tickvals: groupIndices,
-                    ticktext: grouped.map((entry) => entry.group),
-                    title: "Groups",
-                    fixedrange: false,
-                    range: [-0.6, groupIndices.length - 0.4]
-                  },
-                  yaxis: {
-                    ...baseLayout.yaxis,
-                    title: metric.label,
-                    fixedrange: false,
-                    range: [0, maxY * 1.05]
-                  },
-                  shapes,
-                  annotations,
-                  hovermode: "closest"
+              <Box
+                sx={{
+                  position: "relative",
+                  "& .hoverlayer": {
+                    display: "none"
+                  }
                 }}
-                config={{
-                  responsive: true,
-                  displaylogo: false,
-                  displayModeBar: true,
-                  scrollZoom: true,
-                  doubleClick: "reset",
-                  modeBarButtonsToRemove: ["lasso2d", "select2d"]
-                }}
-                style={{ width: "100%" }}
-                useResizeHandler
-                onInitialized={registerPlotHandle(metric.id)}
-                onUpdate={registerPlotHandle(metric.id)}
-                onHover={(event: PlotHoverEvent) => handleHover(metric.id, indexByGroup, event)}
-                onUnhover={handleUnhover}
-              />
+              >
+                <PlotlyChart
+                  data={data}
+                  layout={{
+                    ...baseLayout,
+                    font: { ...baseLayout.font, size: plotSettings.fontSize },
+                    margin: { ...baseLayout.margin, t: 40 },
+                    dragmode: "pan",
+                    uirevision: metric.id,
+                    xaxis: {
+                      ...baseLayout.xaxis,
+                      tickvals: groupIndices,
+                      ticktext: grouped.map((entry) => entry.group),
+                      title: "Groups",
+                      fixedrange: false,
+                      range: [-0.6, groupIndices.length - 0.4]
+                    },
+                    yaxis: {
+                      ...baseLayout.yaxis,
+                      title: metric.label,
+                      fixedrange: false,
+                      range: [yLower, yUpper]
+                    },
+                    shapes,
+                    annotations,
+                    hovermode: "closest"
+                  }}
+                  config={{
+                    responsive: true,
+                    displaylogo: false,
+                    displayModeBar: true,
+                    scrollZoom: true,
+                    doubleClick: "reset",
+                    modeBarButtonsToRemove: ["lasso2d", "select2d"]
+                  }}
+                  style={{ width: "100%" }}
+                  useResizeHandler
+                  onInitialized={registerPlotHandle(metric.id)}
+                  onUpdate={registerPlotHandle(metric.id)}
+                  onHover={(event: PlotHoverEvent) => handleHover(metric.id, event)}
+                  onUnhover={handleUnhover}
+                />
+                {tooltipState && tooltipState.metricId === metric.id && (
+                  <Box
+                    sx={{
+                      position: "absolute",
+                      left: tooltipState.left,
+                      top: tooltipState.top,
+                      zIndex: 2,
+                      minWidth: 192,
+                      maxWidth: 236,
+                      px: 1.25,
+                      py: 1,
+                      borderRadius: 1.5,
+                      border: "1px solid rgba(148,163,184,0.45)",
+                      backgroundColor: "rgba(248,250,252,0.96)",
+                      boxShadow: "0 14px 28px rgba(15,23,42,0.16)",
+                      backdropFilter: "blur(10px)",
+                      pointerEvents: "none",
+                      borderLeft: `4px solid ${tooltipState.accentColor}`
+                    }}
+                  >
+                    <Typography variant="caption" sx={{ display: "block", fontWeight: 700, color: "#0f172a" }}>
+                      {tooltipState.title}
+                    </Typography>
+                    {tooltipState.details.map((detail) => (
+                      <Typography
+                        key={`${tooltipState.title}-${detail}`}
+                        variant="caption"
+                        sx={{ display: "block", color: "#475569", lineHeight: 1.45 }}
+                      >
+                        {detail}
+                      </Typography>
+                    ))}
+                  </Box>
+                )}
+              </Box>
               {statBlock?.note && (
                 <Typography variant="caption" color="text.secondary">
                   {statBlock.note}

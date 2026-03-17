@@ -11,6 +11,7 @@ from typing import Dict, Optional, List
 import numpy as np
 
 from threshold_analysis.data_models import ThresholdResults
+from .services.channels import DEFAULT_CHANNEL_DEFINITIONS
 from .services.ratios import DEFAULT_RATIO_DEFINITIONS
 
 
@@ -31,7 +32,10 @@ class RunRecord:
     metadata_path: Optional[Path] = None
     preview_root: Optional[Path] = None
     ratio_definitions: List[Dict[str, object]] = field(default_factory=list)
+    channel_definitions: List[Dict[str, object]] = field(default_factory=lambda: list(DEFAULT_CHANNEL_DEFINITIONS))
     pixel_size_um: Optional[float] = None
+    progress_completed: int = 0
+    progress_total: Optional[int] = None
 
 
 @dataclass
@@ -42,12 +46,16 @@ class StudyRecord:
     input_dir: Optional[Path] = None
     replicate_lookup: Dict[str, Dict[str, Path]] = field(default_factory=dict)
     raw_cache: Dict[str, Dict[int, np.ndarray]] = field(default_factory=dict)
+    raw_cache_source: Dict[str, str] = field(default_factory=dict)
     preview_cache: Dict[str, Path] = field(default_factory=dict)
     preview_plane_root: Optional[Path] = None
     is_3d: bool = True
     loaded_at: datetime = field(default_factory=datetime.utcnow)
     ratio_definitions: List[Dict[str, object]] = field(default_factory=lambda: list(DEFAULT_RATIO_DEFINITIONS))
+    channel_definitions: List[Dict[str, object]] = field(default_factory=lambda: list(DEFAULT_CHANNEL_DEFINITIONS))
     pixel_size_um: Optional[float] = None
+    analysis_cache: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    statistics_cache: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
 class GlobalState:

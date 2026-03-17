@@ -15,9 +15,19 @@ class RatioDefinition(BaseModel):
     denominator_channel: int = Field(..., ge=1, le=3)
 
 
+class ChannelDefinition(BaseModel):
+    channel: int = Field(..., ge=1, le=3)
+    label: str = Field(..., min_length=1)
+    color: str = Field(..., min_length=1)
+
+
 class ConfigScanRequest(BaseModel):
-    input_dir: str = Field(..., description="Directory containing ND2 data to scan")
-    recursive: bool = Field(True, description="Whether to search recursively for ND2 files")
+    input_dir: str = Field(..., description="Directory containing microscopy data to scan")
+    recursive: bool = Field(True, description="Whether to search recursively for supported microscopy files")
+    subject_strategy: Literal["per_file", "auto"] = Field(
+        "per_file",
+        description="How to assign subject IDs: per_file keeps each file distinct; auto infers shared IDs from filename tokens.",
+    )
 
 
 class ReplicaInfo(BaseModel):
@@ -50,6 +60,7 @@ class ConfigCreateRequest(BaseModel):
     thresholds: Optional[Dict[str, Dict[str, float]]] = None
     output_path: Optional[str] = None
     ratios: Optional[List[RatioDefinition]] = None
+    channel_definitions: Optional[List[ChannelDefinition]] = None
 
 
 class ConfigCreateResponse(BaseModel):
@@ -57,6 +68,19 @@ class ConfigCreateResponse(BaseModel):
     study_name: str
     groups: Dict[str, List[str]]
     ratios: Optional[List[RatioDefinition]] = None
+    channel_definitions: Optional[List[ChannelDefinition]] = None
+
+
+class ConfigAutoGroupRequest(BaseModel):
+    input_dir: str
+    instructions: str = Field(..., min_length=3, description="Natural language grouping instructions")
+    model: Optional[str] = Field(None, description="Optional OpenAI model override")
+
+
+class ConfigAutoGroupResponse(BaseModel):
+    groups: Dict[str, List[str]]
+    model: str
+    notes: Optional[str] = None
 
 
 class ConfigReadResponse(BaseModel):
@@ -66,6 +90,7 @@ class ConfigReadResponse(BaseModel):
     pixel_size_um: Optional[float] = None
     thresholds: Optional[Dict[str, Dict[str, float]]] = None
     ratios: Optional[List[RatioDefinition]] = None
+    channel_definitions: Optional[List[ChannelDefinition]] = None
 
 
 class ThresholdRunRequest(BaseModel):
@@ -91,18 +116,21 @@ class RunStatus(BaseModel):
     completed_at: Optional[datetime] = None
     latest_source_mtime: Optional[datetime] = None
     source_hash: Optional[str] = None
+    progress_completed: int = 0
+    progress_total: Optional[int] = None
 
 
 class LoadStudyRequest(BaseModel):
     file_path: str
     input_dir_override: Optional[str] = Field(
         None,
-        description="Optional path to the ND2 root directory if it differs from the value stored in the metadata.",
+        description="Optional path to the source-image root directory if it differs from the value stored in metadata.",
     )
 
 
 class AnalyzeRequest(BaseModel):
     thresholds: Dict[str, int]
+    analysis_mode: str = Field("positive_area_percent", pattern="^positive_area_percent$")
 
 
 class MouseAverageRecord(BaseModel):
@@ -139,6 +167,7 @@ class StatisticsRequest(BaseModel):
     comparison_pairs: Optional[List[List[str]]] = None
     test_type: str = Field("anova_parametric", pattern="^(anova_parametric|anova_non_parametric|t_test)$")
     significance_display: str = Field("stars", pattern="^(stars|p_values)$")
+    analysis_mode: str = Field("positive_area_percent", pattern="^positive_area_percent$")
 
 
 class StatisticsResponse(BaseModel):
@@ -154,14 +183,23 @@ class ChannelRange(BaseModel):
     vmax: float = Field(1, ge=0)
 
 
+class PreviewPrioritySubject(BaseModel):
+    group: str
+    subject_id: str
+    filename: str
+
+
 class PreviewRequest(BaseModel):
     thresholds: Dict[str, int]
     groups: Optional[List[str]] = None
-    max_samples_per_group: int = Field(1, ge=1, le=6)
+    max_samples_per_group: int = Field(1, ge=1, le=20)
     metric: Optional[str] = None
     metrics: Optional[List[str]] = None
     group_sample_limits: Optional[Dict[str, int]] = None
     channel_ranges: Optional[Dict[str, ChannelRange]] = None
+    revision_key: Optional[str] = None
+    priority_subjects: Optional[List[PreviewPrioritySubject]] = None
+    prefer_generated_assets: bool = True
 
 
 class PreviewImage(BaseModel):
@@ -172,6 +210,7 @@ class PreviewImage(BaseModel):
     subject_id: str
     filename: str
     image_path: str
+    cache_token: str
 
 
 class PreviewResponse(BaseModel):
@@ -234,6 +273,14 @@ class RatioUpdateRequest(BaseModel):
 
 class RatioUpdateResponse(BaseModel):
     ratios: List[RatioDefinition]
+
+
+class ChannelUpdateRequest(BaseModel):
+    channels: List[ChannelDefinition]
+
+
+class ChannelUpdateResponse(BaseModel):
+    channels: List[ChannelDefinition]
 
 
 AnalyzeResponse.model_rebuild()

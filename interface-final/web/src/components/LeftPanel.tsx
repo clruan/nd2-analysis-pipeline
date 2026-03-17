@@ -6,10 +6,12 @@ import {
   Button,
   Chip,
   Checkbox,
-  Divider,
+  Collapse,
   FormControl,
   FormControlLabel,
+  IconButton,
   InputLabel,
+  LinearProgress,
   MenuItem,
   Select,
   Slider,
@@ -18,8 +20,11 @@ import {
   TextField,
   Typography
 } from "@mui/material";
+import ExpandLessIcon from "@mui/icons-material/ExpandLess";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import { useAppStore } from "../state/useAppStore";
 import {
+  useConfigAutoGroups,
   useConfigCreate,
   useConfigRead,
   useConfigScan,
@@ -27,11 +32,16 @@ import {
   useLoadStudy,
   useRunStatus,
   useThresholdRun,
+  useUpdateChannels,
   useUpdateRatios,
   usePixelSizeUpdate
 } from "../api/hooks";
-import type { ConfigScanResponse, RatioDefinition } from "../api/types";
-import { DEFAULT_RATIO_DEFINITIONS } from "../constants/metrics";
+import type { ChannelDefinition, ConfigScanResponse, RatioDefinition } from "../api/types";
+import {
+  DEFAULT_CHANNEL_DEFINITIONS,
+  DEFAULT_RATIO_DEFINITIONS,
+  normalizeChannelDefinitions
+} from "../constants/metrics";
 
 const sliderMarks = [0, 1000, 2000, 3000, 4000].map((value) => ({
   value,
@@ -85,8 +95,20 @@ const palettePresets: PalettePreset[] = [
   }
 ];
 
-type StepId = "nd2" | "config" | "run" | "load";
+type StepId = "project" | "configuration" | "analysis";
 type GuideState = "completed" | "active" | "upcoming";
+type ModuleId =
+  | "scan"
+  | "config_builder"
+  | "analysis_controls"
+  | "visualization_settings"
+  | "threshold_generation"
+  | "study_loader";
+type ChannelKey = "channel_1" | "channel_2" | "channel_3";
+type ChannelWindowDraft = { min: string; threshold: string; max: string };
+type ChannelWindowCommitSource = "min" | "threshold" | "max";
+
+const channelKeys: ChannelKey[] = ["channel_1", "channel_2", "channel_3"];
 
 const baseSectionSx = {
   borderRadius: 2,
@@ -130,6 +152,11 @@ const normalizeGroupMapping = (groups: Record<string, string[]>): Record<string,
   return normalized;
 };
 
+const pairToken = (first: string, second: string) =>
+  [first, second]
+    .sort((a, b) => a.localeCompare(b))
+    .join("::");
+
 const getErrorMessage = (error: unknown) => {
   if (!error) return "Unknown error";
   if (isAxiosError(error)) {
@@ -146,6 +173,57 @@ const getErrorMessage = (error: unknown) => {
   return typeof error === "string" ? error : JSON.stringify(error);
 };
 
+const clampIntensity = (value: number) => Math.max(0, Math.min(4095, Math.round(value)));
+
+const parseIntensityDraft = (value: string): number | null => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return clampIntensity(parsed);
+};
+
+const buildChannelWindowDrafts = (
+  ranges: Record<ChannelKey, [number, number]>,
+  thresholds: Record<string, number>
+): Record<ChannelKey, ChannelWindowDraft> =>
+  channelKeys.reduce<Record<ChannelKey, ChannelWindowDraft>>((acc, channel) => {
+    acc[channel] = {
+      min: String(ranges[channel][0]),
+      threshold: String(thresholds[channel]),
+      max: String(ranges[channel][1]),
+    };
+    return acc;
+  }, {} as Record<ChannelKey, ChannelWindowDraft>);
+
+const sliderValueFromDraft = (
+  range: [number, number],
+  threshold: number,
+  draft: ChannelWindowDraft
+): [number, number, number] => {
+  const min = parseIntensityDraft(draft.min);
+  const thresholdValue = parseIntensityDraft(draft.threshold);
+  const max = parseIntensityDraft(draft.max);
+  if (min === null || thresholdValue === null || max === null) {
+    return [range[0], threshold, range[1]];
+  }
+  const sorted = [min, thresholdValue, max].sort((a, b) => a - b) as [number, number, number];
+  return sorted;
+};
+
+const getActiveSliderThumbIndex = () => {
+  if (typeof document === "undefined") {
+    return 1;
+  }
+  const raw = document.activeElement?.getAttribute("data-index");
+  const parsed = raw === null ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) ? parsed : 1;
+};
+
 export default function LeftPanel() {
   const {
     study,
@@ -154,7 +232,9 @@ export default function LeftPanel() {
     statisticsSettings,
     plotSettings,
     ratioDefinitions,
+    channelDefinitions,
     setThreshold,
+    setThresholdControlHovered,
     setStudy,
     setStatisticsEnabled,
     setComparisonMode,
@@ -171,15 +251,20 @@ export default function LeftPanel() {
     setJitterEnabled,
     setJitterWidth,
     setRatioDefinitions,
+    setChannelDefinitions,
+    previewSamplesPerGroup,
+    setPreviewSamplesPerGroup,
     previewChannelRanges,
     setPreviewChannelRange,
     resetPreviewChannelRanges,
     updateStudy
   } = useAppStore();
   const [inputDir, setInputDir] = useState("");
+  const [scanSubjectStrategy, setScanSubjectStrategy] = useState<"per_file" | "auto">("per_file");
   const [configPath, setConfigPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
   const [resultsPath, setResultsPath] = useState("");
+  const [activeStage, setActiveStage] = useState<StepId>("project");
   const [configOriginalName, setConfigOriginalName] = useState<string | null>(null);
   const [resultsOriginalName, setResultsOriginalName] = useState<string | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -187,18 +272,33 @@ export default function LeftPanel() {
   const [groupsJson, setGroupsJson] = useState("{}");
   const [pixelSize, setPixelSize] = useState("");
   const [configError, setConfigError] = useState<string | null>(null);
+  const [autoGroupInstructions, setAutoGroupInstructions] = useState("");
+  const [autoGroupModel, setAutoGroupModel] = useState("");
   const [groupMap, setGroupMap] = useState<Record<string, string[]>>({});
   const [newGroupName, setNewGroupName] = useState("");
   const [subjectInputs, setSubjectInputs] = useState<Record<string, string>>({});
-  const [pairSelection, setPairSelection] = useState<{ first: string; second: string }>({ first: "", second: "" });
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [ratioDrafts, setRatioDrafts] = useState<RatioDefinition[]>(DEFAULT_RATIO_DEFINITIONS);
+  const [channelDrafts, setChannelDrafts] = useState<ChannelDefinition[]>(DEFAULT_CHANNEL_DEFINITIONS);
   const [studyRatioDrafts, setStudyRatioDrafts] = useState<RatioDefinition[]>(DEFAULT_RATIO_DEFINITIONS);
+  const [studyChannelDrafts, setStudyChannelDrafts] = useState<ChannelDefinition[]>(DEFAULT_CHANNEL_DEFINITIONS);
   const [palettePresetOverride, setPalettePresetOverride] = useState<string | null>(null);
   const [studyPixelSize, setStudyPixelSize] = useState("");
   const [pixelSizeError, setPixelSizeError] = useState<string | null>(null);
+  const [collapsedModules, setCollapsedModules] = useState<Record<ModuleId, boolean>>({
+    scan: false,
+    config_builder: false,
+    analysis_controls: false,
+    visualization_settings: false,
+    threshold_generation: false,
+    study_loader: false,
+  });
+  const [channelWindowDrafts, setChannelWindowDrafts] = useState<Record<ChannelKey, ChannelWindowDraft>>(() =>
+    buildChannelWindowDrafts(previewChannelRanges as Record<ChannelKey, [number, number]>, thresholds)
+  );
 
   const scanMutation = useConfigScan();
+  const autoGroupsMutation = useConfigAutoGroups();
   const configMutation = useConfigCreate();
   const configReadMutation = useConfigRead();
   const runMutation = useThresholdRun();
@@ -206,11 +306,36 @@ export default function LeftPanel() {
   const statusQuery = useRunStatus(jobId);
   const uploadMutation = useFileUpload();
   const updateRatiosMutation = useUpdateRatios(study?.study_id ?? null);
+  const updateChannelsMutation = useUpdateChannels(study?.study_id ?? null);
   const pixelSizeMutation = usePixelSizeUpdate(study?.study_id ?? null);
   const configInputRef = useRef<HTMLInputElement>(null);
   const resultsInputRef = useRef<HTMLInputElement>(null);
+  const activeSliderThumbRef = useRef<Record<ChannelKey, number>>({
+    channel_1: 1,
+    channel_2: 1,
+    channel_3: 1,
+  });
+
+  useEffect(() => {
+    return () => {
+      setThresholdControlHovered(false);
+    };
+  }, [setThresholdControlHovered]);
 
   const studyGroups = useMemo(() => study?.groups ?? [], [study?.groups]);
+  const pairOptions = useMemo<Array<[string, string]>>(() => {
+    const options: Array<[string, string]> = [];
+    for (let index = 0; index < studyGroups.length; index += 1) {
+      for (let other = index + 1; other < studyGroups.length; other += 1) {
+        options.push([studyGroups[index], studyGroups[other]]);
+      }
+    }
+    return options;
+  }, [studyGroups]);
+  const selectedPairTokens = useMemo(
+    () => new Set(statisticsSettings.comparisonPairs.map(([first, second]) => pairToken(first, second))),
+    [statisticsSettings.comparisonPairs]
+  );
 
   const handleStudyPixelSizeSave = () => {
     if (!study) return;
@@ -249,6 +374,11 @@ export default function LeftPanel() {
   }, [ratioDefinitions, study?.study_id]);
 
   useEffect(() => {
+    const normalized = normalizeChannelDefinitions(channelDefinitions);
+    setStudyChannelDrafts(normalized);
+  }, [channelDefinitions, study?.study_id]);
+
+  useEffect(() => {
     setPalettePresetOverride(null);
   }, [study?.study_id]);
 
@@ -273,10 +403,6 @@ export default function LeftPanel() {
     });
   }, [groupMap]);
 
-  useEffect(() => {
-    setPairSelection({ first: "", second: "" });
-  }, [statisticsSettings.comparisonMode, study?.study_id]);
-
   const scanDefaults = useMemo(() => {
     if (!scanResult) return {};
     const defaults: Record<string, string[]> = {};
@@ -286,13 +412,48 @@ export default function LeftPanel() {
     return defaults;
   }, [scanResult]);
 
+  const scannedSubjects = useMemo(
+    () =>
+      (scanResult?.groups ?? [])
+        .flatMap((group) =>
+          group.subjects.map((subject) => ({
+            subjectId: subject.subject_id,
+            detectedGroup: group.group_name,
+            replicates: subject.replicates.map((replicate) => replicate.filename),
+            replicateCount: subject.replicates.length
+          }))
+        )
+        .sort((a, b) => a.subjectId.localeCompare(b.subjectId, undefined, { numeric: true, sensitivity: "base" })),
+    [scanResult]
+  );
+
+  const assignedGroupBySubject = useMemo(() => {
+    const next: Record<string, string> = {};
+    scannedSubjects.forEach((subject) => {
+      const mappedGroup = Object.entries(groupMap).find(([, subjects]) => subjects.includes(subject.subjectId))?.[0];
+      next[subject.subjectId] = mappedGroup ?? subject.detectedGroup;
+    });
+    return next;
+  }, [groupMap, scannedSubjects]);
+
+  const assignSubjectToGroup = (subjectId: string, targetGroup: string) => {
+    if (!targetGroup.trim()) return;
+    setGroupMap((prev) => {
+      const next: Record<string, string[]> = Object.fromEntries(
+        Object.entries(prev).map(([group, subjects]) => [group, subjects.filter((item) => item !== subjectId)])
+      );
+      if (!next[targetGroup]) {
+        next[targetGroup] = [];
+      }
+      next[targetGroup] = Array.from(new Set([...next[targetGroup], subjectId])).sort((a, b) =>
+        a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" })
+      );
+      return next;
+    });
+    setConfigError(null);
+  };
+
   const statsControlsDisabled = !statisticsEnabled || studyGroups.length === 0;
-  const canAddPair =
-    statisticsEnabled &&
-    statisticsSettings.comparisonMode === "pairs" &&
-    pairSelection.first &&
-    pairSelection.second &&
-    pairSelection.first !== pairSelection.second;
 
   useEffect(() => {
     if (!studyGroups.length) {
@@ -340,12 +501,13 @@ export default function LeftPanel() {
 
   const jitterEnabled = plotSettings.jitterEnabled;
 
-  const handleAddPair = () => {
-    if (!canAddPair) {
+  const togglePairSelection = (pair: [string, string]) => {
+    const token = pairToken(pair[0], pair[1]);
+    if (selectedPairTokens.has(token)) {
+      removeComparisonPair(pair);
       return;
     }
-    addComparisonPair([pairSelection.first, pairSelection.second]);
-    setPairSelection({ first: "", second: "" });
+    addComparisonPair(pair);
   };
 
   const handlePalettePresetChange = (value: string) => {
@@ -484,12 +646,38 @@ export default function LeftPanel() {
     updateRatioDraft(setRatioDrafts, index, patch);
   const handleStudyRatioChange = (index: number, patch: Partial<RatioDefinition>) =>
     updateRatioDraft(setStudyRatioDrafts, index, patch);
+  const updateChannelDraft = (
+    setter: React.Dispatch<React.SetStateAction<ChannelDefinition[]>>,
+    channel: number,
+    patch: Partial<ChannelDefinition>
+  ) => {
+    setter((prev) =>
+      normalizeChannelDefinitions(
+        prev.map((entry) => {
+          if (entry.channel !== channel) {
+            return entry;
+          }
+          return {
+            ...entry,
+            ...patch,
+            channel: entry.channel
+          };
+        })
+      )
+    );
+  };
+  const handleConfigChannelChange = (channel: number, patch: Partial<ChannelDefinition>) =>
+    updateChannelDraft(setChannelDrafts, channel, patch);
+  const handleStudyChannelChange = (channel: number, patch: Partial<ChannelDefinition>) =>
+    updateChannelDraft(setStudyChannelDrafts, channel, patch);
   const addConfigRatio = () => addRatioDraft(setRatioDrafts);
   const addStudyRatio = () => addRatioDraft(setStudyRatioDrafts);
   const removeConfigRatio = (index: number) => removeRatioDraft(setRatioDrafts, index);
   const removeStudyRatio = (index: number) => removeRatioDraft(setStudyRatioDrafts, index);
   const resetConfigRatios = () => setRatioDrafts(DEFAULT_RATIO_DEFINITIONS);
+  const resetConfigChannels = () => setChannelDrafts(DEFAULT_CHANNEL_DEFINITIONS);
   const resetStudyRatios = () => setStudyRatioDrafts(ratioDefinitions);
+  const resetStudyChannels = () => setStudyChannelDrafts(normalizeChannelDefinitions(channelDefinitions));
   const handleStudyRatioSave = async () => {
     if (!study) return;
     try {
@@ -499,21 +687,147 @@ export default function LeftPanel() {
       /* handled below */
     }
   };
+  const handleStudyChannelSave = async () => {
+    if (!study) return;
+    try {
+      const response = await updateChannelsMutation.mutateAsync(studyChannelDrafts);
+      const normalized = normalizeChannelDefinitions(response.channels);
+      setChannelDefinitions(normalized);
+      updateStudy({ channel_definitions: normalized });
+    } catch (error) {
+      /* handled below */
+    }
+  };
 
-  const clampIntensity = (value: number) => Math.max(0, Math.min(4095, Math.round(value)));
-  const applyChannelWindow = (
-    channel: "channel_1" | "channel_2" | "channel_3",
-    next: { min?: number; threshold?: number; max?: number }
+  const configChannelLabelMap = useMemo(
+    () =>
+      normalizeChannelDefinitions(channelDrafts).reduce<Record<number, string>>((acc, definition) => {
+        acc[definition.channel] = definition.label;
+        return acc;
+      }, {}),
+    [channelDrafts]
+  );
+  const studyChannelLabelMap = useMemo(
+    () =>
+      normalizeChannelDefinitions(studyChannelDrafts).reduce<Record<number, string>>((acc, definition) => {
+        acc[definition.channel] = definition.label;
+        return acc;
+      }, {}),
+    [studyChannelDrafts]
+  );
+
+  useEffect(() => {
+    setChannelWindowDrafts(buildChannelWindowDrafts(previewChannelRanges as Record<ChannelKey, [number, number]>, thresholds));
+  }, [
+    previewChannelRanges,
+    thresholds.channel_1,
+    thresholds.channel_2,
+    thresholds.channel_3,
+  ]);
+
+  const buildSliderChannelWindowDraft = (
+    channel: ChannelKey,
+    value: number[],
+    activeThumb: number
+  ): ChannelWindowDraft => {
+    const draft = channelWindowDrafts[channel];
+    const [rangeMin, rangeMax] = previewChannelRanges[channel];
+    const currentMin = parseIntensityDraft(draft.min) ?? rangeMin;
+    const currentThreshold = parseIntensityDraft(draft.threshold) ?? thresholds[channel];
+    const currentMax = parseIntensityDraft(draft.max) ?? rangeMax;
+
+    if (activeThumb === 0) {
+      return {
+        min: String(clampIntensity(Math.min(value[0], currentThreshold))),
+        threshold: String(clampIntensity(currentThreshold)),
+        max: String(clampIntensity(currentMax)),
+      };
+    }
+
+    if (activeThumb === 2) {
+      return {
+        min: String(clampIntensity(currentMin)),
+        threshold: String(clampIntensity(currentThreshold)),
+        max: String(clampIntensity(Math.max(value[2], currentThreshold))),
+      };
+    }
+
+    const nextThreshold = clampIntensity(value[1]);
+    return {
+      min: String(clampIntensity(Math.min(currentMin, nextThreshold))),
+      threshold: String(nextThreshold),
+      max: String(clampIntensity(Math.max(currentMax, nextThreshold))),
+    };
+  };
+
+  const commitChannelWindow = (
+    channel: ChannelKey,
+    _source: ChannelWindowCommitSource,
+    overrideDraft?: ChannelWindowDraft
   ) => {
     const [currentMin, currentMax] = previewChannelRanges[channel];
-    const min = clampIntensity(next.min ?? currentMin);
-    const maxCandidate = clampIntensity(next.max ?? currentMax);
-    const resolvedMin = Math.min(min, maxCandidate);
-    const resolvedMax = Math.max(resolvedMin + 1, maxCandidate);
-    const thresholdValue = clampIntensity(next.threshold ?? thresholds[channel]);
-    const clampedThreshold = Math.min(Math.max(thresholdValue, resolvedMin), resolvedMax);
-    setPreviewChannelRange(channel, [resolvedMin, resolvedMax]);
-    setThreshold(channel, clampedThreshold);
+    const draft = overrideDraft ?? channelWindowDrafts[channel];
+    const minCandidate = parseIntensityDraft(draft.min) ?? currentMin;
+    const thresholdCandidate = parseIntensityDraft(draft.threshold) ?? thresholds[channel];
+    const maxCandidate = parseIntensityDraft(draft.max) ?? currentMax;
+
+    // Histogram/statistics should follow threshold only; Min/Max are display bounds.
+    const resolvedThreshold = thresholdCandidate;
+    const resolvedMin = Math.min(minCandidate, thresholdCandidate);
+    const resolvedMax = Math.max(maxCandidate, thresholdCandidate);
+
+    const normalizedMin = clampIntensity(resolvedMin);
+    const normalizedThreshold = clampIntensity(resolvedThreshold);
+    const normalizedMax = clampIntensity(resolvedMax);
+
+    if (currentMin !== normalizedMin || currentMax !== normalizedMax) {
+      setPreviewChannelRange(channel, [normalizedMin, normalizedMax]);
+    }
+    if (thresholds[channel] !== normalizedThreshold) {
+      setThreshold(channel, normalizedThreshold);
+    }
+    setChannelWindowDrafts((previous) => ({
+      ...previous,
+      [channel]: {
+        min: String(normalizedMin),
+        threshold: String(normalizedThreshold),
+        max: String(normalizedMax),
+      },
+    }));
+  };
+
+  const handleChannelWindowDraftChange = (channel: ChannelKey, field: keyof ChannelWindowDraft, value: string) => {
+    setChannelWindowDrafts((previous) => ({
+      ...previous,
+      [channel]: {
+        ...previous[channel],
+        [field]: value,
+      },
+    }));
+  };
+
+  const handleChannelWindowKeyDown = (
+    event: React.KeyboardEvent<HTMLElement>,
+    channel: ChannelKey,
+    source: Exclude<ChannelWindowCommitSource, "slider">
+  ) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitChannelWindow(channel, source);
+      event.currentTarget.blur();
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setChannelWindowDrafts((previous) => ({
+        ...previous,
+        [channel]: {
+          min: String(previewChannelRanges[channel][0]),
+          threshold: String(thresholds[channel]),
+          max: String(previewChannelRanges[channel][1]),
+        },
+      }));
+      event.currentTarget.blur();
+    }
   };
 
   const removeRatioDraft = (setter: React.Dispatch<React.SetStateAction<RatioDefinition[]>>, index: number) => {
@@ -521,6 +835,9 @@ export default function LeftPanel() {
   };
 
   const availableGroupNames = useMemo(() => Object.keys(groupMap).sort(), [groupMap]);
+  const configChannels = useMemo(() => normalizeChannelDefinitions(channelDrafts), [channelDrafts]);
+  const studyChannels = useMemo(() => normalizeChannelDefinitions(studyChannelDrafts), [studyChannelDrafts]);
+  const activeStudyChannels = useMemo(() => normalizeChannelDefinitions(channelDefinitions), [channelDefinitions]);
   const hasGroups = availableGroupNames.length > 0;
   const builderSummary = useMemo(() => {
     const subjectCount = Object.values(groupMap).reduce((acc, subjects) => acc + subjects.length, 0);
@@ -594,35 +911,28 @@ export default function LeftPanel() {
   }, [study?.nd2_root, inputDir]);
 
   const workflowSteps = useMemo<Array<{ id: StepId; title: string; description: string; completed: boolean; state: GuideState }>>(() => {
-    const nd2Complete = Boolean(inputDir.trim());
-    const configComplete = Boolean(configPath && hasGroups);
-    const runComplete =
-      Boolean(resultsPath) || Boolean(statusQuery.data?.state === "succeeded" && statusQuery.data.output_path);
-    const loadComplete = Boolean(study);
+    const projectComplete = Boolean(scanResult);
+    const runComplete = Boolean(resultsPath) || Boolean(statusQuery.data?.state === "succeeded" && statusQuery.data?.output_path);
+    const configurationComplete = Boolean(configPath && hasGroups && runComplete);
+    const analysisComplete = Boolean(study);
     const base: Array<{ id: StepId; title: string; description: string; completed: boolean }> = [
       {
-        id: "nd2",
-        title: "Input ND2 directory",
-        description: "Point to the folder with ND2 files, then scan for subjects.",
-        completed: nd2Complete
+        id: "project",
+        title: "Project",
+        description: "Scan microscopy data",
+        completed: projectComplete
       },
       {
-        id: "config",
-        title: "Configure groups",
-        description: "Edit detected cohorts and save a config JSON.",
-        completed: configComplete
+        id: "configuration",
+        title: "Configuration",
+        description: "Set groups + generate",
+        completed: configurationComplete
       },
       {
-        id: "run",
-        title: "Run thresholds",
-        description: "Generate threshold results for the current config.",
-        completed: runComplete
-      },
-      {
-        id: "load",
-        title: "Load study",
-        description: "Load the latest results JSON to unlock analysis.",
-        completed: loadComplete
+        id: "analysis",
+        title: "Analysis",
+        description: "Load study + inspect",
+        completed: analysisComplete
       }
     ];
     const firstPending = base.find((step) => !step.completed)?.id ?? null;
@@ -633,7 +943,7 @@ export default function LeftPanel() {
   }, [
     configPath,
     hasGroups,
-    inputDir,
+    scanResult,
     resultsPath,
     statusQuery.data?.output_path,
     statusQuery.data?.state,
@@ -651,6 +961,35 @@ export default function LeftPanel() {
 
   const getStepState = (stepId: StepId): GuideState => stepStateById[stepId] ?? "upcoming";
   const sectionSx = (stepId: StepId) => sectionStylesForState(getStepState(stepId));
+  const toggleModule = (moduleId: ModuleId) => {
+    setCollapsedModules((previous) => ({
+      ...previous,
+      [moduleId]: !previous[moduleId],
+    }));
+  };
+  const renderModule = (
+    moduleId: ModuleId,
+    stepId: StepId,
+    title: string,
+    children: React.ReactNode
+  ) => (
+    <Box sx={sectionSx(stepId)}>
+      <Stack spacing={1.25}>
+        <Stack direction="row" alignItems="center" justifyContent="space-between">
+          <Typography variant="subtitle1">{title}</Typography>
+          <IconButton size="small" onClick={() => toggleModule(moduleId)}>
+            {collapsedModules[moduleId] ? <ExpandMoreIcon fontSize="small" /> : <ExpandLessIcon fontSize="small" />}
+          </IconButton>
+        </Stack>
+        <Collapse in={!collapsedModules[moduleId]}>
+          <Box>{children}</Box>
+        </Collapse>
+      </Stack>
+    </Box>
+  );
+  const showProjectModules = activeStage === "project";
+  const showConfigurationModules = activeStage === "configuration";
+  const showAnalysisModules = activeStage === "analysis";
 
   return (
     <Stack spacing={2} px={3} py={3} sx={{ minHeight: "100%" }}>
@@ -660,57 +999,83 @@ export default function LeftPanel() {
             Study Pipeline
           </Typography>
           <Typography variant="body2" color="text.secondary" gutterBottom>
-            Provide the ND2 directory and optional config path. The interface can scan the folder, create a configuration, run threshold generation, and load the results—all from here.
+            Scan microscopy files, configure groups and modules, then run threshold generation and analysis.
           </Typography>
         </Box>
       )}
 
-      {!study && (
+      <Box
+        sx={{
+          borderRadius: 2,
+          border: "1px solid rgba(15,23,42,0.1)",
+          p: 2,
+          backgroundColor: "#ffffff"
+        }}
+      >
+        <Typography variant="subtitle2" gutterBottom>
+          Workflow stages
+        </Typography>
+        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
+          Select a stage to focus only on its related modules.
+        </Typography>
         <Box
           sx={{
-            borderRadius: 2,
-            border: "1px solid rgba(15,23,42,0.1)",
-            p: 2,
-            backgroundColor: "#ffffff"
+            display: "grid",
+            gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+            gap: 1
           }}
         >
-          <Typography variant="subtitle2" gutterBottom>
-            Interactive workflow
-          </Typography>
-          <Stack spacing={1}>
-            {workflowSteps.map((step, index) => (
+          {workflowSteps.map((step, index) => {
+            const isSelected = activeStage === step.id;
+            return (
               <Box
                 key={step.id}
-                sx={{ borderRadius: 1.5, p: 1, backgroundColor: step.state === "active" ? "rgba(37,99,235,0.08)" : "transparent" }}
+                onClick={() => setActiveStage(step.id)}
+                sx={{
+                  borderRadius: 1.25,
+                  p: 0.9,
+                  minHeight: 78,
+                  border: `1px solid ${
+                    isSelected ? "rgba(37,99,235,0.6)" : step.state === "completed" ? "rgba(34,197,94,0.45)" : "rgba(15,23,42,0.1)"
+                  }`,
+                  backgroundColor: isSelected ? "rgba(37,99,235,0.1)" : "#fff",
+                  cursor: "pointer"
+                }}
               >
-                <Stack direction="row" spacing={1} alignItems="center">
+                <Stack direction="row" spacing={0.5} alignItems="center">
                   <Chip
-                    label={`Step ${index + 1}`}
+                    label={index + 1}
                     size="small"
-                    color={step.state === "completed" ? "success" : step.state === "active" ? "primary" : "default"}
-                    variant={step.state === "upcoming" ? "outlined" : "filled"}
+                    color={isSelected ? "primary" : step.state === "completed" ? "success" : "default"}
+                    variant={isSelected || step.state === "completed" ? "filled" : "outlined"}
+                    sx={{ minWidth: 30 }}
                   />
-                  <Typography variant="body2">{step.title}</Typography>
+                <Typography variant="caption" sx={{ fontWeight: 600, lineHeight: 1.15 }}>
+                  {step.title}
+                </Typography>
                 </Stack>
-                <Typography variant="caption" color="text.secondary" sx={{ ml: 5 }}>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5, lineHeight: 1.15, minHeight: 26 }}>
                   {step.description}
                 </Typography>
               </Box>
-            ))}
-          </Stack>
+            );
+          })}
         </Box>
-      )}
+      </Box>
 
-
-      <Box sx={sectionSx("nd2")}>
-        <Stack spacing={1.5}>
+      {showProjectModules &&
+        renderModule(
+          "scan",
+          "project",
+          "Scan Directory",
+          <Stack spacing={1.5}>
           <TextField
-            label="ND2 Input Directory"
+            label="Microscopy Input Directory"
             value={inputDir}
             onChange={(event) => setInputDir(event.target.value)}
             size="small"
             fullWidth
-            placeholder="/path/to/nd2"
+            placeholder="/path/to/images"
           />
           <Stack direction="row" spacing={1}>
             <Button
@@ -719,7 +1084,10 @@ export default function LeftPanel() {
               disabled={!inputDir || scanMutation.isPending}
               onClick={async () => {
                 try {
-                  const response = await scanMutation.mutateAsync({ input_dir: inputDir });
+                  const response = await scanMutation.mutateAsync({
+                    input_dir: inputDir,
+                    subject_strategy: scanSubjectStrategy
+                  });
                   setScanResult(response);
                   const groups: Record<string, string[]> = {};
                   response.groups.forEach((group) => {
@@ -738,12 +1106,22 @@ export default function LeftPanel() {
               {scanMutation.isPending ? "Scanning..." : "Scan Directory"}
             </Button>
           </Stack>
+          <FormControlLabel
+            control={
+              <Switch
+                size="small"
+                checked={scanSubjectStrategy === "auto"}
+                onChange={(event) => setScanSubjectStrategy(event.target.checked ? "auto" : "per_file")}
+              />
+            }
+            label="Auto infer shared subject IDs from filename tokens"
+          />
           <Typography variant="caption" color="text.secondary">
             {builderSummary.groupCount} editable groups • {builderSummary.subjectCount} subjects in the builder.
           </Typography>
           {scanSummary && (
             <Typography variant="caption" color="text.secondary">
-              Last scan detected {scanSummary.groupCount} groups across {scanSummary.subjectCount} subjects ({scanSummary.files} ND2 files).
+              Last scan detected {scanSummary.groupCount} groups across {scanSummary.subjectCount} subjects ({scanSummary.files} files: ND2/CZI/OIB/OIF).
             </Typography>
           )}
           {availableGroupNames.length > 0 && (
@@ -757,11 +1135,75 @@ export default function LeftPanel() {
           )}
           {scanMutation.isError && <Alert severity="error">{getErrorMessage(scanMutation.error)}</Alert>}
         </Stack>
-      </Box>
+        )}
 
-      <Box sx={sectionSx("config")}>
-        {scanResult || hasGroups ? (
+      {showConfigurationModules &&
+        renderModule(
+          "config_builder",
+          "configuration",
+          "Build Configuration",
+          scanResult || hasGroups ? (
           <Stack spacing={1.75}>
+            <Stack spacing={1}>
+              <Typography variant="subtitle1">Natural Language Grouping</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Describe how files should be grouped (for complex naming patterns). Requires `OPENAI_API_KEY` on the backend.
+              </Typography>
+              <TextField
+                size="small"
+                fullWidth
+                label="Optional model"
+                placeholder="gpt-4.1-mini"
+                value={autoGroupModel}
+                onChange={(event) => setAutoGroupModel(event.target.value)}
+              />
+              <TextField
+                label="Grouping instructions"
+                size="small"
+                fullWidth
+                multiline
+                minRows={3}
+                placeholder="Example: Group all subject IDs ending with odd numbers into Treatment A and even numbers into Control."
+                value={autoGroupInstructions}
+                onChange={(event) => setAutoGroupInstructions(event.target.value)}
+              />
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Button
+                  variant="outlined"
+                  size="small"
+                  disabled={!inputDir || !autoGroupInstructions.trim() || autoGroupsMutation.isPending}
+                  onClick={async () => {
+                    try {
+                      const response = await autoGroupsMutation.mutateAsync({
+                        input_dir: inputDir,
+                        instructions: autoGroupInstructions.trim(),
+                        model: autoGroupModel.trim() || undefined
+                      });
+                      const normalized = normalizeGroupMapping(response.groups);
+                      setGroupMap(normalized);
+                      setGroupsJson(JSON.stringify(normalized, null, 2));
+                      setSubjectInputs({});
+                      setConfigError(null);
+                    } catch (error) {
+                      setConfigError(getErrorMessage(error));
+                    }
+                  }}
+                >
+                  {autoGroupsMutation.isPending ? "Generating..." : "Generate groups with AI"}
+                </Button>
+                {autoGroupsMutation.isSuccess && (
+                  <Typography variant="caption" color="text.secondary">
+                    Generated with {autoGroupsMutation.data.model}
+                  </Typography>
+                )}
+              </Stack>
+              {autoGroupsMutation.isError && (
+                <Alert severity="error">{getErrorMessage(autoGroupsMutation.error)}</Alert>
+              )}
+              {autoGroupsMutation.data?.notes && (
+                <Alert severity="info">{autoGroupsMutation.data.notes}</Alert>
+              )}
+            </Stack>
             <Stack direction="row" spacing={1} alignItems="center">
               <Button
                 variant="outlined"
@@ -796,7 +1238,8 @@ export default function LeftPanel() {
                       groups: parsedGroups,
                       pixel_size_um: pixelSize ? Number(pixelSize) : undefined,
                       output_path: configPath || undefined,
-                      ratios: ratioDrafts
+                      ratios: ratioDrafts,
+                      channel_definitions: configChannels
                     });
                     setConfigPath(response.config_path);
                     setGroupsJson(JSON.stringify(parsedGroups, null, 2));
@@ -816,6 +1259,79 @@ export default function LeftPanel() {
             </Stack>
             {configMutation.isError && <Alert severity="error">{getErrorMessage(configMutation.error)}</Alert>}
             {configError && <Alert severity="error">{configError}</Alert>}
+            {scannedSubjects.length > 0 && (
+              <Stack spacing={1.25}>
+                <Typography variant="subtitle1">Subject & Replica Assignment</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Assign detected subjects to groups and verify which replica files will be included.
+                </Typography>
+                <Box
+                  sx={{
+                    maxHeight: 300,
+                    overflowY: "auto",
+                    borderRadius: 1.5,
+                    border: "1px solid rgba(15,23,42,0.08)",
+                    p: 1.25,
+                    backgroundColor: "rgba(15,23,42,0.02)"
+                  }}
+                >
+                  <Stack spacing={1}>
+                    {scannedSubjects.map((subject) => {
+                      const assignedGroup = assignedGroupBySubject[subject.subjectId] ?? subject.detectedGroup;
+                      const groupChoices = Array.from(
+                        new Set([subject.detectedGroup, assignedGroup, ...availableGroupNames].filter(Boolean))
+                      ).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+                      const previewFiles = subject.replicates.slice(0, 2).join(", ");
+                      const remainingFiles = Math.max(0, subject.replicates.length - 2);
+
+                      return (
+                        <Box
+                          key={`subject-assignment-${subject.subjectId}`}
+                          sx={{
+                            borderRadius: 1,
+                            border: "1px solid rgba(15,23,42,0.08)",
+                            backgroundColor: "#fff",
+                            p: 1
+                          }}
+                        >
+                          <Stack
+                            direction={{ xs: "column", sm: "row" }}
+                            spacing={1}
+                            alignItems={{ sm: "center" }}
+                            justifyContent="space-between"
+                          >
+                            <Typography variant="body2" sx={{ minWidth: 110, fontWeight: 600 }}>
+                              {subject.subjectId}
+                            </Typography>
+                            <TextField
+                              select
+                              size="small"
+                              label="Group"
+                              value={assignedGroup}
+                              onChange={(event) => assignSubjectToGroup(subject.subjectId, event.target.value as string)}
+                              sx={{ minWidth: 180 }}
+                            >
+                              {groupChoices.map((groupName) => (
+                                <MenuItem key={`subject-${subject.subjectId}-${groupName}`} value={groupName}>
+                                  {groupName}
+                                </MenuItem>
+                              ))}
+                            </TextField>
+                            <Typography variant="caption" color="text.secondary">
+                              {subject.replicateCount} replicas
+                            </Typography>
+                          </Stack>
+                          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                            {previewFiles || "No replica files detected"}
+                            {remainingFiles > 0 ? ` +${remainingFiles} more` : ""}
+                          </Typography>
+                        </Box>
+                      );
+                    })}
+                  </Stack>
+                </Box>
+              </Stack>
+            )}
             <Stack spacing={1.75}>
               <Typography variant="subtitle1">Group Builder</Typography>
               <Typography variant="caption" color="text.secondary">
@@ -976,7 +1492,51 @@ export default function LeftPanel() {
                 helperText="JSON mapping of group -> subjects. Edit and choose Apply JSON override to sync the builder."
               />
             </Stack>
-            <Stack spacing={1}>
+            <Stack spacing={1.25}>
+              <Stack direction="row" alignItems="center" justifyContent="space-between">
+                <Typography variant="subtitle1">Config Channels</Typography>
+                <Button variant="text" size="small" onClick={resetConfigChannels} disabled={configMutation.isPending}>
+                  Reset
+                </Button>
+              </Stack>
+              <Typography variant="caption" color="text.secondary">
+                Name channels and choose pseudocolors for preview rendering and plot labels.
+              </Typography>
+              {configChannels.map((channel) => (
+                <Box
+                  key={`config-channel-${channel.channel}`}
+                  sx={{
+                    border: "1px solid rgba(15,23,42,0.08)",
+                    borderRadius: 2,
+                    p: 1.25,
+                    backgroundColor: "#fff"
+                  }}
+                >
+                  <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ sm: "center" }}>
+                    <Typography variant="caption" sx={{ minWidth: 90, fontWeight: 600 }}>
+                      Ch{channel.channel}
+                    </Typography>
+                    <TextField
+                      label="Label"
+                      size="small"
+                      fullWidth
+                      value={channel.label}
+                      onChange={(event) => handleConfigChannelChange(channel.channel, { label: event.target.value })}
+                    />
+                    <TextField
+                      type="color"
+                      label="Color"
+                      size="small"
+                      value={channel.color}
+                      onChange={(event) => handleConfigChannelChange(channel.channel, { color: event.target.value })}
+                      sx={{ width: 110 }}
+                      inputProps={{ style: { padding: 0, height: 34 } }}
+                    />
+                  </Stack>
+                </Box>
+              ))}
+            </Stack>
+            <Stack spacing={1.25}>
               <Stack direction="row" alignItems="center" justifyContent="space-between">
                 <Typography variant="subtitle1">Config Ratios</Typography>
                 <Button variant="text" size="small" onClick={resetConfigRatios} disabled={configMutation.isPending}>
@@ -990,47 +1550,65 @@ export default function LeftPanel() {
                 <Box
                   key={ratio.id ?? `config-ratio-${index}`}
                   sx={{
-                    display: "grid",
-                    gridTemplateColumns: { xs: "1fr", sm: "1fr repeat(2, 160px) auto" },
-                    gap: 8,
-                    alignItems: "center"
+                    border: "1px solid rgba(15,23,42,0.08)",
+                    borderRadius: 2,
+                    p: 1.25,
+                    backgroundColor: "#fff"
                   }}
                 >
-                  <TextField
-                    label="Label"
-                    size="small"
-                    fullWidth
-                    value={ratio.label}
-                    onChange={(event) => handleConfigRatioChange(index, { label: event.target.value })}
-                  />
-                  <TextField
-                    label="Numerator"
-                    size="small"
-                    type="number"
-                    inputProps={{ min: 1, max: 3 }}
-                    value={ratio.numerator_channel}
-                    onChange={(event) => handleConfigRatioChange(index, { numerator_channel: Number(event.target.value) })}
-                  />
-                  <TextField
-                    label="Denominator"
-                    size="small"
-                    type="number"
-                    inputProps={{ min: 1, max: 3 }}
-                    value={ratio.denominator_channel}
-                    onChange={(event) =>
-                      handleConfigRatioChange(index, { denominator_channel: Number(event.target.value) })
-                    }
-                  />
-                  <Button
-                    variant="text"
-                    size="small"
-                    color="error"
-                    onClick={() => removeConfigRatio(index)}
-                    disabled={ratioDrafts.length <= 1}
-                    sx={{ justifySelf: { xs: "flex-start", sm: "center" } }}
-                  >
-                    Remove
-                  </Button>
+                  <Stack spacing={1}>
+                    <TextField
+                      label="Ratio name"
+                      size="small"
+                      fullWidth
+                      value={ratio.label}
+                      onChange={(event) => handleConfigRatioChange(index, { label: event.target.value })}
+                    />
+                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ sm: "center" }}>
+                      <TextField
+                        select
+                        fullWidth
+                        size="small"
+                        label="Numerator channel"
+                        value={ratio.numerator_channel}
+                        onChange={(event) =>
+                          handleConfigRatioChange(index, { numerator_channel: Number(event.target.value) })
+                        }
+                      >
+                        {[1, 2, 3].map((channel) => (
+                          <MenuItem key={`config-ratio-num-${index}-${channel}`} value={channel}>
+                            {configChannelLabelMap[channel] ?? `Channel ${channel}`}
+                          </MenuItem>
+                        ))}
+                      </TextField>
+                      <TextField
+                        select
+                        fullWidth
+                        size="small"
+                        label="Denominator channel"
+                        value={ratio.denominator_channel}
+                        onChange={(event) =>
+                          handleConfigRatioChange(index, { denominator_channel: Number(event.target.value) })
+                        }
+                      >
+                        {[1, 2, 3].map((channel) => (
+                          <MenuItem key={`config-ratio-den-${index}-${channel}`} value={channel}>
+                            {configChannelLabelMap[channel] ?? `Channel ${channel}`}
+                          </MenuItem>
+                        ))}
+                      </TextField>
+                      <Button
+                        variant="text"
+                        size="small"
+                        color="error"
+                        onClick={() => removeConfigRatio(index)}
+                        disabled={ratioDrafts.length <= 1}
+                        sx={{ alignSelf: { xs: "flex-start", sm: "center" }, whiteSpace: "nowrap" }}
+                      >
+                        Remove
+                      </Button>
+                    </Stack>
+                  </Stack>
                 </Box>
               ))}
               <Button
@@ -1053,30 +1631,74 @@ export default function LeftPanel() {
           </Stack>
         ) : (
           <Typography variant="caption" color="text.secondary">
-            Scan an ND2 directory to unlock group editing, JSON overrides, ratio presets, and config exports.
+            Scan a microscopy directory to unlock group editing, JSON overrides, channel presets, ratio presets, and config exports.
           </Typography>
+        )
         )}
-      </Box>
 
-      <Divider flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />
-
-      <Box sx={sectionSx("run")}>
-        <Stack spacing={1.5}>
+      {showAnalysisModules &&
+        study &&
+        renderModule(
+          "analysis_controls",
+          "analysis",
+          "Analysis Controls",
+          <Stack spacing={1.5}>
+        <Typography variant="caption" color="text.secondary">
+          Default mode only: positive signal fraction (%) from thresholded channels.
+        </Typography>
+        <Box>
+          <Typography variant="caption" color="text.secondary">
+            Subjects per group in preview: {previewSamplesPerGroup}
+          </Typography>
+          <Slider
+            size="small"
+            min={1}
+            max={20}
+            step={1}
+            marks={[1, 5, 10, 15, 20].map((value) => ({ value, label: String(value) }))}
+            value={previewSamplesPerGroup}
+            onChange={(_, value) => {
+              const numeric = Array.isArray(value) ? value[0] : value;
+              setPreviewSamplesPerGroup(typeof numeric === "number" ? numeric : 1);
+            }}
+            sx={{ mt: 0.5, maxWidth: 280 }}
+          />
+          <Typography variant="caption" color="text.secondary">
+            Set this above 1, then click subject chips under each group in the Preview pane to switch pictures.
+          </Typography>
+        </Box>
         <Typography variant="subtitle1">Threshold &amp; Range</Typography>
         <Typography variant="caption" color="text.secondary">
           Threshold only controls the mask; Min/Max control the raw intensity window for live previews. Overlay combines both.
         </Typography>
-        {(["channel_1", "channel_2", "channel_3"] as const).map((channel, index) => {
+        {channelKeys.map((channel, index) => {
           const range = previewChannelRanges[channel];
           const thresholdValue = Math.min(Math.max(thresholds[channel], range[0]), range[1]);
+          const definition = activeStudyChannels[index] ?? DEFAULT_CHANNEL_DEFINITIONS[index];
+          const draft = channelWindowDrafts[channel];
+          const sliderValue = sliderValueFromDraft(range, thresholdValue, draft);
+          const displayMin = draft.min.trim() || String(range[0]);
+          const displayThreshold = draft.threshold.trim() || String(thresholdValue);
+          const displayMax = draft.max.trim() || String(range[1]);
           return (
             <Box key={channel}>
               <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+                <Stack direction="row" spacing={0.75} alignItems="center">
+                  <Box
+                    sx={{
+                      width: 10,
+                      height: 10,
+                      borderRadius: "50%",
+                      backgroundColor: definition.color,
+                      border: "1px solid rgba(15,23,42,0.2)"
+                    }}
+                  />
+                  <Typography variant="caption" color="text.secondary">
+                    {definition.label}
+                  </Typography>
+                </Stack>
                 <Typography variant="caption" color="text.secondary">
-                  {`Channel ${index + 1}`}
-                </Typography>
-                <Typography variant="caption" color="text.secondary">
-                  {`Min ${range[0]} • Thr ${thresholdValue} • Max ${range[1]}`}
+                  {`Min ${displayMin} • Thr ${displayThreshold} • Max ${displayMax}`}
                 </Typography>
               </Stack>
               <Slider
@@ -1085,6 +1707,8 @@ export default function LeftPanel() {
                 max={4095}
                 marks={sliderMarks}
                 disableSwap
+                onMouseEnter={() => setThresholdControlHovered(true)}
+                onMouseLeave={() => setThresholdControlHovered(false)}
                 sx={{
                   color: "rgba(15,23,42,0.35)",
                   mt: 1,
@@ -1111,12 +1735,31 @@ export default function LeftPanel() {
                     boxShadow: "0 0 0 4px rgba(37,99,235,0.18)"
                   }
                 }}
-                value={[range[0], thresholdValue, range[1]]}
-                onChange={(_, value) => {
+                value={sliderValue}
+                onChange={(_event, value) => {
                   if (!Array.isArray(value) || value.length !== 3) {
                     return;
                   }
-                  applyChannelWindow(channel, { min: value[0], threshold: value[1], max: value[2] });
+                  const activeThumb = getActiveSliderThumbIndex();
+                  activeSliderThumbRef.current[channel] = activeThumb;
+                  const nextDraft = buildSliderChannelWindowDraft(channel, value, activeThumb);
+                  setChannelWindowDrafts((previous) => ({
+                    ...previous,
+                    [channel]: nextDraft,
+                  }));
+                }}
+                onChangeCommitted={(_event, value) => {
+                  if (!Array.isArray(value) || value.length !== 3) {
+                    return;
+                  }
+                  const activeThumb = activeSliderThumbRef.current[channel] ?? getActiveSliderThumbIndex();
+                  const nextDraft = buildSliderChannelWindowDraft(channel, value, activeThumb);
+                  setChannelWindowDrafts((previous) => ({
+                    ...previous,
+                    [channel]: nextDraft,
+                  }));
+                  const source: ChannelWindowCommitSource = activeThumb === 0 ? "min" : activeThumb === 2 ? "max" : "threshold";
+                  commitChannelWindow(channel, source, nextDraft);
                 }}
               />
               <Stack direction="row" spacing={1}>
@@ -1124,25 +1767,31 @@ export default function LeftPanel() {
                   size="small"
                   type="number"
                   label="Min"
-                  value={range[0]}
+                  value={draft.min}
                   inputProps={{ min: 0, max: 4095 }}
-                  onChange={(event) => applyChannelWindow(channel, { min: Number(event.target.value) })}
+                  onChange={(event) => handleChannelWindowDraftChange(channel, "min", event.target.value)}
+                  onBlur={() => commitChannelWindow(channel, "min")}
+                  onKeyDown={(event) => handleChannelWindowKeyDown(event, channel, "min")}
                 />
                 <TextField
                   size="small"
                   type="number"
                   label="Threshold"
-                  value={thresholdValue}
+                  value={draft.threshold}
                   inputProps={{ min: 0, max: 4095 }}
-                  onChange={(event) => applyChannelWindow(channel, { threshold: Number(event.target.value) })}
+                  onChange={(event) => handleChannelWindowDraftChange(channel, "threshold", event.target.value)}
+                  onBlur={() => commitChannelWindow(channel, "threshold")}
+                  onKeyDown={(event) => handleChannelWindowKeyDown(event, channel, "threshold")}
                 />
                 <TextField
                   size="small"
                   type="number"
                   label="Max"
-                  value={range[1]}
+                  value={draft.max}
                   inputProps={{ min: 1, max: 4095 }}
-                  onChange={(event) => applyChannelWindow(channel, { max: Number(event.target.value) })}
+                  onChange={(event) => handleChannelWindowDraftChange(channel, "max", event.target.value)}
+                  onBlur={() => commitChannelWindow(channel, "max")}
+                  onKeyDown={(event) => handleChannelWindowKeyDown(event, channel, "max")}
                 />
               </Stack>
             </Box>
@@ -1240,61 +1889,19 @@ export default function LeftPanel() {
             )}
             {statisticsSettings.comparisonMode === "pairs" && (
               <Stack spacing={1}>
-                <Stack direction="row" spacing={1}>
-                  <TextField
-                    select
-                    size="small"
-                    label="Group A"
-                    value={pairSelection.first}
-                    onChange={(event) =>
-                      setPairSelection((prev) => ({ ...prev, first: event.target.value as string }))
-                    }
-                    disabled={statsControlsDisabled}
-                    InputLabelProps={{ shrink: true }}
-                    SelectProps={{
-                      displayEmpty: true,
-                      renderValue: (selected) => (selected ? String(selected) : "Select group")
-                    }}
-                    fullWidth
-                  >
-                    <MenuItem value="" disabled>
-                      Select group
-                    </MenuItem>
-                    {studyGroups.map((group) => (
-                      <MenuItem key={group} value={group}>
-                        {group}
-                      </MenuItem>
-                    ))}
-                  </TextField>
-                  <TextField
-                    select
-                    size="small"
-                    label="Group B"
-                    value={pairSelection.second}
-                    onChange={(event) =>
-                      setPairSelection((prev) => ({ ...prev, second: event.target.value as string }))
-                    }
-                    disabled={statsControlsDisabled}
-                    InputLabelProps={{ shrink: true }}
-                    SelectProps={{
-                      displayEmpty: true,
-                      renderValue: (selected) => (selected ? String(selected) : "Select group")
-                    }}
-                    fullWidth
-                  >
-                    <MenuItem value="" disabled>
-                      Select group
-                    </MenuItem>
-                    {studyGroups.map((group) => (
-                      <MenuItem key={group} value={group}>
-                        {group}
-                      </MenuItem>
-                    ))}
-                  </TextField>
-                </Stack>
+                <Typography variant="caption" color="text.secondary">
+                  Select one or more pair comparisons.
+                </Typography>
                 <Stack direction="row" spacing={1} alignItems="center">
-                  <Button variant="outlined" size="small" disabled={!canAddPair} onClick={handleAddPair}>
-                    Add pair
+                  <Button
+                    variant="outlined"
+                    size="small"
+                    disabled={statsControlsDisabled || pairOptions.length === 0}
+                    onClick={() => {
+                      pairOptions.forEach((pair) => addComparisonPair(pair));
+                    }}
+                  >
+                    Select all
                   </Button>
                   {statisticsSettings.comparisonPairs.length > 0 && (
                     <Button
@@ -1308,22 +1915,25 @@ export default function LeftPanel() {
                   )}
                 </Stack>
                 <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                  {statisticsSettings.comparisonPairs.map((pair) => {
-                    const key = `${pair[0]}-${pair[1]}`;
+                  {pairOptions.map((pair) => {
+                    const key = pairToken(pair[0], pair[1]);
+                    const selected = selectedPairTokens.has(key);
                     return (
                       <Chip
                         key={key}
+                        clickable
+                        disabled={statsControlsDisabled}
                         size="small"
                         label={`${pair[0]} ↔ ${pair[1]}`}
-                        onDelete={
-                          statisticsEnabled ? () => removeComparisonPair(pair) : undefined
-                        }
+                        color={selected ? "primary" : "default"}
+                        variant={selected ? "filled" : "outlined"}
+                        onClick={() => togglePairSelection(pair)}
                       />
                     );
                   })}
-                  {statisticsSettings.comparisonPairs.length === 0 && (
+                  {pairOptions.length === 0 && (
                     <Typography variant="caption" color="text.secondary">
-                      Add pairs to compare specific groups.
+                      At least two groups are required for pairwise comparisons.
                     </Typography>
                   )}
                 </Stack>
@@ -1336,14 +1946,16 @@ export default function LeftPanel() {
             )}
           </Stack>
         </Stack>
-        </Stack>
-      </Box>
+      </Stack>
+        )}
 
-      <Divider flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />
-
-      <Box sx={sectionSx("load")}>
-        <Stack spacing={1.5}>
-        <Typography variant="subtitle1">Visualization Settings</Typography>
+      {showAnalysisModules &&
+        study &&
+        renderModule(
+          "visualization_settings",
+          "analysis",
+          "Visualization Settings",
+          <Stack spacing={1.5}>
         <Typography variant="caption" color="text.secondary">
           Tune the figure aesthetics before exporting charts.
         </Typography>
@@ -1467,13 +2079,15 @@ export default function LeftPanel() {
             </Stack>
           ))}
         </Stack>
-        </Stack>
-      </Box>
+      </Stack>
+        )}
 
-      <Divider flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />
-
-      <Box sx={sectionSx("run")}>
-        <Stack spacing={1.5}>
+      {showConfigurationModules &&
+        renderModule(
+          "threshold_generation",
+          "configuration",
+          "Threshold Generation",
+          <Stack spacing={1.5}>
         <Stack spacing={0.5}>
           <Stack direction="row" spacing={1}>
             <TextField
@@ -1524,6 +2138,7 @@ export default function LeftPanel() {
                 } else {
                   setRatioDrafts(DEFAULT_RATIO_DEFINITIONS);
                 }
+                setChannelDrafts(normalizeChannelDefinitions(response.channel_definitions));
                 setConfigError(null);
               } catch (error) {
                 setConfigError(getErrorMessage(error));
@@ -1558,12 +2173,32 @@ export default function LeftPanel() {
             }
           }}
         >
-          {runMutation.isPending ? "Launching..." : "Run Threshold Generation"}
+          {runMutation.isPending ? "Launching..." : "Run Threshold Generation (All stacks)"}
         </Button>
         {statusQuery.data && (
           <Alert severity={statusQuery.data.state === "failed" ? "error" : statusQuery.data.state === "succeeded" ? "success" : "info"}>
             {statusQuery.data.state.toUpperCase()}: {statusQuery.data.message ?? "Processing"}
           </Alert>
+        )}
+        {statusQuery.data && (statusQuery.data.state === "queued" || statusQuery.data.state === "running") && (
+          <Stack spacing={0.5}>
+            <LinearProgress
+              variant={statusQuery.data.progress_total ? "determinate" : "indeterminate"}
+              value={
+                statusQuery.data.progress_total
+                  ? Math.min(
+                      100,
+                      (statusQuery.data.progress_completed / Math.max(statusQuery.data.progress_total, 1)) * 100
+                    )
+                  : undefined
+              }
+            />
+            <Typography variant="caption" color="text.secondary">
+              {statusQuery.data.progress_total
+                ? `Processed ${statusQuery.data.progress_completed}/${statusQuery.data.progress_total} files`
+                : "Preparing threshold generation..."}
+            </Typography>
+          </Stack>
         )}
         {cacheInfo && (
           <Typography variant="caption" color="text.secondary">
@@ -1573,14 +2208,15 @@ export default function LeftPanel() {
         )}
         {runMutation.isError && <Alert severity="error">{getErrorMessage(runMutation.error)}</Alert>}
         {configReadMutation.isError && <Alert severity="error">{getErrorMessage(configReadMutation.error)}</Alert>}
-        </Stack>
-      </Box>
+      </Stack>
+        )}
 
-      <Divider flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />
-
-      <Box sx={sectionSx("load")}>
-      <Box sx={sectionSx("load")}>
-        <Stack spacing={1.5}>
+      {showAnalysisModules &&
+        renderModule(
+          "study_loader",
+          "analysis",
+          "Load Study Results",
+          <Stack spacing={1.5}>
         <Stack spacing={0.5}>
           <Stack direction="row" spacing={1}>
             <TextField
@@ -1640,7 +2276,7 @@ export default function LeftPanel() {
         )}
         {study && !study.nd2_available && (
           <Alert severity="warning">
-            ND2 directory unavailable at {study.nd2_root}. Mount or copy the folder, update “ND2 Input Directory”, and load the study
+            Source image directory unavailable at {study.nd2_root}. Mount or copy the folder, update “Microscopy Input Directory”, and load the study
             again to unlock previews.
           </Alert>
         )}
@@ -1666,6 +2302,70 @@ export default function LeftPanel() {
             <Typography variant="caption" color="text.secondary">
               Controls scale bars for preview panels and downloads.
             </Typography>
+          </Stack>
+        )}
+        {study && (
+          <Stack spacing={1}>
+            <Stack direction="row" alignItems="center" justifyContent="space-between">
+              <Typography variant="subtitle1">Study Channels</Typography>
+              <Button variant="text" size="small" onClick={resetStudyChannels} disabled={updateChannelsMutation.isPending}>
+                Reset to current
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              Update channel labels and pseudocolors for this loaded study.
+            </Typography>
+            {studyChannels.map((channel) => (
+              <Box
+                key={`study-channel-${channel.channel}`}
+                sx={{
+                  border: "1px solid rgba(15,23,42,0.08)",
+                  borderRadius: 2,
+                  p: 1.25,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 1
+                }}
+              >
+                <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ sm: "center" }}>
+                  <Typography variant="caption" sx={{ minWidth: 90, fontWeight: 600 }}>
+                    Ch{channel.channel}
+                  </Typography>
+                  <TextField
+                    label="Label"
+                    size="small"
+                    fullWidth
+                    value={channel.label}
+                    onChange={(event) => handleStudyChannelChange(channel.channel, { label: event.target.value })}
+                  />
+                  <TextField
+                    type="color"
+                    label="Color"
+                    size="small"
+                    value={channel.color}
+                    onChange={(event) => handleStudyChannelChange(channel.channel, { color: event.target.value })}
+                    sx={{ width: 110 }}
+                    inputProps={{ style: { padding: 0, height: 34 } }}
+                  />
+                </Stack>
+              </Box>
+            ))}
+            <Stack direction="row" spacing={1}>
+              <Button
+                variant="contained"
+                size="small"
+                disabled={updateChannelsMutation.isPending}
+                onClick={handleStudyChannelSave}
+              >
+                {updateChannelsMutation.isPending ? "Saving..." : "Save channels"}
+              </Button>
+            </Stack>
+            {updateChannelsMutation.isError && (
+              <Alert severity="error">{getErrorMessage(updateChannelsMutation.error)}</Alert>
+            )}
+            {updateChannelsMutation.isSuccess && (
+              <Alert severity="success">Channels updated for this study.</Alert>
+            )}
           </Stack>
         )}
         {study && (
@@ -1702,25 +2402,35 @@ export default function LeftPanel() {
                   <TextField
                     label="Numerator"
                     size="small"
-                    type="number"
+                    select
                     fullWidth
                     sx={{ flex: 1, minWidth: 0 }}
-                    inputProps={{ min: 1, max: 3 }}
                     value={ratio.numerator_channel}
                     onChange={(event) => handleStudyRatioChange(index, { numerator_channel: Number(event.target.value) })}
-                  />
+                  >
+                    {[1, 2, 3].map((channel) => (
+                      <MenuItem key={`study-ratio-num-${index}-${channel}`} value={channel}>
+                        {studyChannelLabelMap[channel] ?? `Channel ${channel}`}
+                      </MenuItem>
+                    ))}
+                  </TextField>
                   <TextField
                     label="Denominator"
                     size="small"
-                    type="number"
+                    select
                     fullWidth
                     sx={{ flex: 1, minWidth: 0 }}
-                    inputProps={{ min: 1, max: 3 }}
                     value={ratio.denominator_channel}
                     onChange={(event) =>
                       handleStudyRatioChange(index, { denominator_channel: Number(event.target.value) })
                     }
-                  />
+                  >
+                    {[1, 2, 3].map((channel) => (
+                      <MenuItem key={`study-ratio-den-${index}-${channel}`} value={channel}>
+                        {studyChannelLabelMap[channel] ?? `Channel ${channel}`}
+                      </MenuItem>
+                    ))}
+                  </TextField>
                   <Button
                     variant="text"
                     size="small"
@@ -1763,13 +2473,8 @@ export default function LeftPanel() {
             )}
           </Stack>
         )}
-        </Stack>
-      </Box>
-
-
-      </Box>
-
-      <Divider flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />
+      </Stack>
+        )}
     </Stack>
   );
 }

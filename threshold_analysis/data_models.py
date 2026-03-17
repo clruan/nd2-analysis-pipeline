@@ -1,7 +1,7 @@
 """Data models for interactive threshold analysis."""
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
@@ -37,6 +37,9 @@ class ThresholdResults:
     study_name: str
     image_data: List[ThresholdData]
     group_info: Dict[str, List[str]]  # group_name -> list of mouse_ids
+    ratio_definitions: Optional[List[Dict[str, Any]]] = None
+    channel_definitions: Optional[List[Dict[str, Any]]] = None
+    pixel_size_um: Optional[float] = None
     
     def get_mouse_averages(self, thresholds: Dict[str, int]) -> pd.DataFrame:
         """Calculate mouse averages for given thresholds."""
@@ -55,4 +58,3 @@ class ThresholdResults:
         df = pd.DataFrame(results)
         # Average by mouse (in case multiple images per mouse)
         return df.groupby(['Group', 'MouseID']).mean().reset_index()
-

@@ -13,6 +13,8 @@ class GroupConfig:
     groups: Dict[str, List[str]]
     thresholds: Optional[Dict[str, Dict[str, float]]] = None
     pixel_size_um: Optional[float] = None  # Pixel size in micrometers
+    ratios: Optional[List[Dict[str, Any]]] = None
+    channel_definitions: Optional[List[Dict[str, Any]]] = None
     
     def build_mouse_info(self) -> Dict[str, Dict]:
         """Build a unified dictionary of mouse information."""
@@ -32,7 +34,9 @@ class GroupConfig:
         return cls(
             groups=data.get('groups', {}),
             thresholds=data.get('thresholds', None),
-            pixel_size_um=data.get('pixel_size_um', None)
+            pixel_size_um=data.get('pixel_size_um', None),
+            ratios=data.get('ratios', None),
+            channel_definitions=data.get('channel_definitions', data.get('channels', None))
         )
     
     def to_json(self, json_path: str) -> None:
@@ -40,7 +44,9 @@ class GroupConfig:
         data = {
             'groups': self.groups,
             'thresholds': self.thresholds,
-            'pixel_size_um': self.pixel_size_um
+            'pixel_size_um': self.pixel_size_um,
+            'ratios': self.ratios,
+            'channel_definitions': self.channel_definitions
         }
         with open(json_path, 'w') as f:
             json.dump(data, f, indent=2)

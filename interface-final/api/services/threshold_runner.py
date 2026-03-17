@@ -22,6 +22,7 @@ from data_models import GroupConfig
 from ..schemas import RunStatus, ThresholdRunRequest
 from ..state import RunRecord, STATE
 from ..utils import ensure_directory, find_nd2_files, normalize_path, preview_plane_filename, slugify
+from .channels import DEFAULT_CHANNEL_DEFINITIONS, normalize_channel_definitions
 from .ratios import DEFAULT_RATIO_DEFINITIONS, normalize_ratio_definitions
 from .studies import PREVIEW_ROOT
 
@@ -39,9 +40,11 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
         raise HTTPException(status_code=404, detail=f"Config file not found: {config_path}")
 
     ratio_definitions = list(DEFAULT_RATIO_DEFINITIONS)
+    channel_definitions = list(DEFAULT_CHANNEL_DEFINITIONS)
     try:
         group_config = GroupConfig.from_json(str(config_path))
         ratio_definitions = normalize_ratio_definitions(group_config.ratios)
+        channel_definitions = normalize_channel_definitions(group_config.channel_definitions)
         pixel_size_um = group_config.pixel_size_um
     except Exception:
         # Fall back to defaults when the config cannot be parsed.
@@ -56,6 +59,10 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
 
     sources_latest_mtime, source_hash, sources = _fingerprint_sources(input_dir, config_path)
     metadata_path = _metadata_path(output_path)
+    try:
+        progress_total = len(find_nd2_files(input_dir))
+    except Exception:
+        progress_total = None
     record = RunRecord(
         job_id=job_id,
         state="queued",
@@ -68,7 +75,9 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
         source_hash=source_hash,
         metadata_path=metadata_path,
         ratio_definitions=ratio_definitions,
+        channel_definitions=channel_definitions,
         pixel_size_um=pixel_size_um,
+        progress_total=progress_total,
     )
     STATE.record_run(record)
 
@@ -85,7 +94,27 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
     STATE.update_run(job_id, preview_root=record.preview_root)
 
     def _worker() -> None:
-        STATE.update_run(job_id, state="running", message="Processing ND2 files")
+        STATE.update_run(
+            job_id,
+            state="running",
+            message="Processing microscopy files",
+            progress_completed=0,
+            progress_total=record.progress_total,
+        )
+
+        def _on_progress(completed: int, total: int, label: str) -> None:
+            noun = "file" if total == 1 else "files"
+            message = f"Processed {completed}/{total} {noun}"
+            if label:
+                message = f"{message}: {label}"
+            STATE.update_run(
+                job_id,
+                state="running",
+                message=message,
+                progress_completed=completed,
+                progress_total=total,
+            )
+
         try:
             results = process_directory_all_thresholds(
                 input_dir=str(record.input_dir),
@@ -96,6 +125,7 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
                 n_jobs=payload.n_jobs,
                 max_threshold=payload.max_threshold,
                 save_intermediate=True,
+                progress_callback=_on_progress,
             )
         except Exception as exc:  # pragma: no cover
             STATE.update_run(job_id, state="failed", message=str(exc), completed_at=datetime.utcnow())
@@ -116,6 +146,8 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
             sources_latest_mtime=final_mtime,
             source_hash=final_hash,
             preview_root=record.preview_root,
+            progress_completed=record.progress_total or 0,
+            progress_total=record.progress_total,
         )
 
     background.add_task(_worker)
@@ -131,6 +163,8 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
         started_at=record.started_at,
         latest_source_mtime=_as_datetime(record.sources_latest_mtime),
         source_hash=record.source_hash,
+        progress_completed=record.progress_completed,
+        progress_total=record.progress_total,
     )
 
 
@@ -151,6 +185,8 @@ def describe_run(job_id: str) -> RunStatus:
         completed_at=record.completed_at,
         latest_source_mtime=_as_datetime(record.sources_latest_mtime),
         source_hash=record.source_hash,
+        progress_completed=record.progress_completed,
+        progress_total=record.progress_total,
     )
 
 
@@ -205,6 +241,9 @@ def _maybe_reuse_existing(
     ratio_payload = metadata.get("ratio_definitions")
     if ratio_payload:
         record.ratio_definitions = normalize_ratio_definitions(ratio_payload)
+    channel_payload = metadata.get("channel_definitions")
+    if channel_payload:
+        record.channel_definitions = normalize_channel_definitions(channel_payload)
     pixel_meta = metadata.get("pixel_size_um")
     if pixel_meta is not None:
         record.pixel_size_um = float(pixel_meta)
@@ -339,6 +378,7 @@ def _write_metadata(
             "source_hash": source_hash,
             "sources": list(sources),
             "ratio_definitions": record.ratio_definitions or list(DEFAULT_RATIO_DEFINITIONS),
+            "channel_definitions": record.channel_definitions or list(DEFAULT_CHANNEL_DEFINITIONS),
             "pixel_size_um": record.pixel_size_um,
         }
         with metadata_path.open("w", encoding="utf-8") as handle:

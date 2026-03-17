@@ -2,6 +2,7 @@ import { keepPreviousData, useMutation, useQuery } from "@tanstack/react-query";
 import { api, apiClient } from "./client";
 import type {
   AnalyzeResponse,
+  ConfigAutoGroupResponse,
   ConfigCreateResponse,
   ConfigReadResponse,
   ConfigScanResponse,
@@ -14,15 +15,21 @@ import type {
   UploadResponse,
   RatioUpdateResponse,
   RatioDefinition,
+  ChannelDefinition,
+  ChannelUpdateResponse,
   PixelSizeUpdateResponse,
   PreviewDownloadResponse
 } from "./types";
 
+const DEFAULT_ANALYSIS_MODE = "positive_area_percent" as const;
+
 export type ChannelRangePayload = Partial<Record<"channel_1" | "channel_2" | "channel_3", { vmin: number; vmax: number }>>;
+type PreviewPrioritySubjectPayload = { group: string; subject_id: string; filename: string };
 
 export function useConfigScan() {
   return useMutation({
-    mutationFn: (payload: { input_dir: string; recursive?: boolean }) => api.post<ConfigScanResponse>("/config/scan", payload)
+    mutationFn: (payload: { input_dir: string; recursive?: boolean; subject_strategy?: "per_file" | "auto" }) =>
+      api.post<ConfigScanResponse>("/config/scan", payload)
   });
 }
 
@@ -36,7 +43,15 @@ export function useConfigCreate() {
       thresholds?: Record<string, Record<string, number>>;
       output_path?: string;
       ratios?: RatioDefinition[];
+      channel_definitions?: ChannelDefinition[];
     }) => api.post<ConfigCreateResponse>("/config/create", payload)
+  });
+}
+
+export function useConfigAutoGroups() {
+  return useMutation({
+    mutationFn: (payload: { input_dir: string; instructions: string; model?: string }) =>
+      api.post<ConfigAutoGroupResponse>("/config/auto-groups", payload)
   });
 }
 
@@ -70,18 +85,34 @@ export function useRunStatus(jobId: string | null) {
   return useQuery({
     queryKey: ["run-status", jobId],
     queryFn: () => api.get<RunStatus>(`/runs/${jobId}`),
-    enabled: Boolean(jobId)
+    enabled: Boolean(jobId),
+    refetchInterval: (query) => {
+      const state = query.state.data?.state;
+      return state === "queued" || state === "running" || state === undefined ? 1000 : false;
+    }
   });
 }
 
-export function useAnalysisQuery(studyId: string | null, thresholds: Record<string, number>) {
+export function useAnalysisQuery(
+  studyId: string | null,
+  thresholds: Record<string, number>
+) {
   return useQuery({
-    queryKey: ["analysis", studyId, thresholds.channel_1, thresholds.channel_2, thresholds.channel_3],
+    queryKey: [
+      "analysis",
+      studyId,
+      thresholds.channel_1,
+      thresholds.channel_2,
+      thresholds.channel_3,
+      DEFAULT_ANALYSIS_MODE
+    ],
     queryFn: () =>
       api.post<AnalyzeResponse>(`/studies/${studyId}/analyze`, {
-        thresholds
+        thresholds,
+        analysis_mode: DEFAULT_ANALYSIS_MODE
       }),
-    enabled: Boolean(studyId)
+    enabled: Boolean(studyId),
+    placeholderData: keepPreviousData
   });
 }
 
@@ -115,7 +146,8 @@ export function useStatisticsQuery(
       options.referenceGroup ?? "none",
       pairsKey,
       options.testType,
-      options.significanceDisplay
+      options.significanceDisplay,
+      DEFAULT_ANALYSIS_MODE
     ],
     queryFn: () =>
       api.post<StatisticsResponse>(`/studies/${studyId}/statistics`, {
@@ -124,9 +156,11 @@ export function useStatisticsQuery(
         reference_group: options.referenceGroup,
         comparison_pairs: options.comparisonPairs,
         test_type: options.testType,
-        significance_display: options.significanceDisplay
+        significance_display: options.significanceDisplay,
+        analysis_mode: DEFAULT_ANALYSIS_MODE
       }),
-    enabled: Boolean(studyId) && options.enabled
+    enabled: Boolean(studyId) && options.enabled,
+    placeholderData: keepPreviousData
   });
 }
 
@@ -138,9 +172,19 @@ export function usePreviewQuery(
   groups?: string[],
   groupLimits?: Record<string, number>,
   channelRanges?: ChannelRangePayload,
-  rangeKey?: string
+  rangeKey?: string,
+  options?: {
+    enabled?: boolean;
+    phase?: "focused" | "full" | "default";
+    revisionKey?: string;
+    prioritySubjects?: PreviewPrioritySubjectPayload[];
+    preferGeneratedAssets?: boolean;
+  }
 ) {
   const metricsKey = metrics.length ? metrics.join("|") : "default";
+  const phase = options?.phase ?? "default";
+  const revisionKey = options?.revisionKey ?? "default";
+  const preferGeneratedAssets = options?.preferGeneratedAssets ?? true;
   const limitsKey =
     groupLimits && Object.keys(groupLimits).length
       ? Object.entries(groupLimits)
@@ -148,10 +192,18 @@ export function usePreviewQuery(
           .map(([group, value]) => `${group}:${value}`)
           .join("|")
       : "none";
+  const prioritySubjects = options?.prioritySubjects ?? [];
+  const priorityKey = prioritySubjects.length
+    ? prioritySubjects
+        .map((subject) => `${subject.group}|${subject.subject_id}|${subject.filename}`)
+        .sort()
+        .join("||")
+    : "none";
   return useQuery({
     queryKey: [
       "previews",
       studyId,
+      phase,
       thresholds.channel_1,
       thresholds.channel_2,
       thresholds.channel_3,
@@ -159,18 +211,26 @@ export function usePreviewQuery(
       groups?.join("|") ?? "all",
       sampleCount,
       limitsKey,
-      rangeKey ?? "default"
+      rangeKey ?? "default",
+      revisionKey,
+      priorityKey,
+      preferGeneratedAssets ? "generated" : "source"
     ],
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       api.post<PreviewResponse>(`/studies/${studyId}/previews`, {
         thresholds,
         metrics,
         groups,
         max_samples_per_group: sampleCount,
         group_sample_limits: groupLimits,
-        channel_ranges: channelRanges
+        channel_ranges: channelRanges,
+        revision_key: revisionKey,
+        priority_subjects: prioritySubjects,
+        prefer_generated_assets: preferGeneratedAssets
+      }, {
+        signal
       }),
-    enabled: Boolean(studyId),
+    enabled: options?.enabled ?? Boolean(studyId),
     placeholderData: keepPreviousData
   });
 }
@@ -249,6 +309,19 @@ export function useUpdateRatios(studyId: string | null) {
       }
       return api.post<RatioUpdateResponse>(`/studies/${studyId}/ratios`, {
         ratios
+      });
+    }
+  });
+}
+
+export function useUpdateChannels(studyId: string | null) {
+  return useMutation({
+    mutationFn: (channels: ChannelDefinition[]) => {
+      if (!studyId) {
+        return Promise.reject(new Error("Study not loaded"));
+      }
+      return api.post<ChannelUpdateResponse>(`/studies/${studyId}/channels`, {
+        channels
       });
     }
   });

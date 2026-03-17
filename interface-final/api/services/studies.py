@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timedelta
 import re
 from pathlib import Path
+from threading import Lock
 from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple, Set
 import zipfile
 import logging
@@ -44,6 +45,12 @@ from ..schemas import (
 )
 from ..state import STATE, StudyRecord
 from ..utils import ensure_directory, find_nd2_files, normalize_path, preview_plane_filename, slugify
+from .channels import (
+    DEFAULT_CHANNEL_DEFINITIONS,
+    channel_color_rgb,
+    channel_definition_map,
+    normalize_channel_definitions,
+)
 from .ratios import DEFAULT_RATIO_DEFINITIONS, normalize_ratio_definitions
 from image_processing import load_nd2_file, detect_pixel_size
 from visualization import ND2Visualizer
@@ -53,14 +60,88 @@ DOWNLOAD_ROOT = ensure_directory(Path(__file__).resolve().parent / "generated_do
 PREVIEW_ROOT = ensure_directory(Path(__file__).resolve().parent / "generated_previews")
 
 LOGGER = logging.getLogger(__name__)
+_PREVIEW_REVISION_LOCK = Lock()
+_PREVIEW_LATEST_REVISION: Dict[str, str] = {}
 
 CHANNEL_METRICS: Tuple[Dict[str, object], ...] = (
-    {"id": "channel_1_area", "label": "Channel 1 Area (%)", "kind": "channel", "channel": 1},
-    {"id": "channel_2_area", "label": "Channel 2 Area (%)", "kind": "channel", "channel": 2},
-    {"id": "channel_3_area", "label": "Channel 3 Area (%)", "kind": "channel", "channel": 3},
+    {"id": "channel_1_area", "kind": "channel", "channel": 1},
+    {"id": "channel_2_area", "kind": "channel", "channel": 2},
+    {"id": "channel_3_area", "kind": "channel", "channel": 3},
 )
 
 SUBJECT_TOKEN_PATTERN = re.compile(r"([A-Za-z]+)(\d{1,4})")
+
+
+def _channel_defs_for_record(record: StudyRecord) -> Dict[int, Dict[str, object]]:
+    return channel_definition_map(record.channel_definitions)
+
+
+def _channel_label(record: StudyRecord, channel: int) -> str:
+    defs = _channel_defs_for_record(record)
+    return str(defs.get(channel, {}).get("label", f"Channel {channel}"))
+
+
+def _channel_color(record: StudyRecord, channel: int) -> str:
+    defs = _channel_defs_for_record(record)
+    return str(defs.get(channel, {}).get("color", "#ffffff"))
+
+
+def _channel_area_label(record: StudyRecord, channel: int) -> str:
+    return f"{_channel_label(record, channel)} Area (%)"
+
+
+def _discover_preview_plane_root(study_id: str) -> Optional[Path]:
+    study_root = PREVIEW_ROOT / study_id
+    if not study_root.exists():
+        return None
+    direct_plane_dir = study_root / "planes"
+    if direct_plane_dir.exists():
+        try:
+            next(direct_plane_dir.glob("*.npy"))
+            return study_root
+        except StopIteration:
+            pass
+        except Exception:
+            pass
+
+    candidates: List[Tuple[int, float, Path]] = []
+    try:
+        for plane_dir in study_root.rglob("planes"):
+            if not plane_dir.is_dir():
+                continue
+            try:
+                npy_count = sum(1 for _ in plane_dir.glob("*.npy"))
+            except Exception:
+                continue
+            if npy_count <= 0:
+                continue
+            try:
+                mtime = plane_dir.stat().st_mtime
+            except Exception:
+                mtime = 0.0
+            candidates.append((npy_count, mtime, plane_dir.parent))
+    except Exception:
+        return None
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
+
+
+def _preview_root_has_npy_planes(preview_root: Optional[Path]) -> bool:
+    if not preview_root:
+        return False
+    plane_dir = preview_root / "planes"
+    if not plane_dir.exists():
+        return False
+    try:
+        next(plane_dir.glob("*.npy"))
+        return True
+    except StopIteration:
+        return False
+    except Exception:
+        return False
 
 
 def _canonical_subject_id(value: str) -> str:
@@ -245,12 +326,13 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
         None,
     )
 
-    # Resolve ND2 root directory used to generate the study so we can build previews after restarts
+    # Resolve source image root directory used to generate the study so we can build previews after restarts
     input_dir: Path
     is_3d: bool = True
     preview_plane_root: Optional[Path] = None
-    ratio_definitions: Optional[List[Dict[str, object]]] = None
-    pixel_size_um: Optional[float] = None
+    ratio_definitions: Optional[List[Dict[str, object]]] = getattr(results, "ratio_definitions", None)
+    channel_definitions: Optional[List[Dict[str, object]]] = getattr(results, "channel_definitions", None)
+    pixel_size_um: Optional[float] = getattr(results, "pixel_size_um", None)
 
     meta: Dict[str, object] = {}
     meta_path = Path(str(path) + ".meta.json")
@@ -270,25 +352,29 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
     if request.input_dir_override:
         override_dir = normalize_path(request.input_dir_override).resolve()
         if not override_dir.exists():
-            raise HTTPException(status_code=404, detail=f"ND2 input directory does not exist: {override_dir}")
+            raise HTTPException(status_code=404, detail=f"Input directory does not exist: {override_dir}")
         if not override_dir.is_dir():
-            raise HTTPException(status_code=400, detail=f"ND2 input directory is not a folder: {override_dir}")
+            raise HTTPException(status_code=400, detail=f"Input directory is not a folder: {override_dir}")
         try:
             sample_nd2 = find_nd2_files(override_dir)
         except Exception as exc:  # pragma: no cover - filesystem edge cases
-            raise HTTPException(status_code=500, detail=f"Unable to scan ND2 directory {override_dir}: {exc}") from exc
+            raise HTTPException(status_code=500, detail=f"Unable to scan input directory {override_dir}: {exc}") from exc
         if not sample_nd2:
             raise HTTPException(
                 status_code=404,
-                detail=f"No ND2 files found under {override_dir}. Select the folder that directly contains the study subdirectories.",
+                detail=f"No supported microscopy files found under {override_dir}. Select the folder that contains your study data.",
             )
 
-    if run_lookup and run_lookup.ratio_definitions:
+    if ratio_definitions is None and run_lookup and run_lookup.ratio_definitions:
         ratio_definitions = run_lookup.ratio_definitions
-    elif meta.get("ratio_definitions"):
+    elif ratio_definitions is None and meta.get("ratio_definitions"):
         ratio_definitions = meta.get("ratio_definitions")
+    if channel_definitions is None and run_lookup and run_lookup.channel_definitions:
+        channel_definitions = run_lookup.channel_definitions
+    elif channel_definitions is None and meta.get("channel_definitions"):
+        channel_definitions = meta.get("channel_definitions")
 
-    if run_lookup and run_lookup.pixel_size_um:
+    if pixel_size_um is None and run_lookup and run_lookup.pixel_size_um:
         pixel_size_um = run_lookup.pixel_size_um
 
     if override_dir:
@@ -305,7 +391,7 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
             if preview_candidate.exists():
                 preview_plane_root = preview_candidate.resolve()
     else:
-        # Last resort: search parents for any ND2 files (shallow)
+        # Last resort: search parents for any supported microscopy files (shallow)
         candidates = [path.parent]
         if path.parent.parent:
             candidates.append(path.parent.parent)
@@ -319,7 +405,14 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
                 continue
         input_dir = found or path.parent
     if override_dir:
-        preview_plane_root = None
+        preview_plane_root = _discover_preview_plane_root(study_id)
+
+    if preview_plane_root is not None and not _preview_root_has_npy_planes(preview_plane_root):
+        discovered_root = _discover_preview_plane_root(study_id)
+        if discovered_root is not None:
+            preview_plane_root = discovered_root
+    if preview_plane_root is None:
+        preview_plane_root = _discover_preview_plane_root(study_id)
 
     config_candidate: Optional[Path] = None
     if run_lookup and run_lookup.config_path:
@@ -327,16 +420,23 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
     elif meta.get("config_path"):
         config_candidate = Path(str(meta["config_path"])).expanduser()
 
-    if ratio_definitions is None and config_candidate and config_candidate.exists():
+    if config_candidate and config_candidate.exists() and (
+        ratio_definitions is None or channel_definitions is None or pixel_size_um is None
+    ):
         try:
             group_config = GroupConfig.from_json(str(config_candidate))
-            ratio_definitions = group_config.ratios
+            if ratio_definitions is None:
+                ratio_definitions = group_config.ratios
+            if channel_definitions is None:
+                channel_definitions = group_config.channel_definitions
             if pixel_size_um is None and group_config.pixel_size_um:
                 pixel_size_um = group_config.pixel_size_um
         except Exception:
-            ratio_definitions = None
+            if ratio_definitions is None:
+                ratio_definitions = None
 
     ratio_definitions = normalize_ratio_definitions(ratio_definitions)
+    channel_definitions = normalize_channel_definitions(channel_definitions)
     if pixel_size_um is None and input_dir:
         pixel_size_um = _detect_pixel_size_from_dir(input_dir)
     replicate_lookup = _build_replicate_lookup(results, input_dir)
@@ -350,6 +450,7 @@ def load_study(request: LoadStudyRequest) -> StudyRecord:
         is_3d=is_3d,
         preview_plane_root=preview_plane_root,
         ratio_definitions=ratio_definitions,
+        channel_definitions=channel_definitions,
         pixel_size_um=pixel_size_um,
     )
     STATE.add_study(record)
@@ -380,6 +481,33 @@ def _build_replicate_lookup(results: ThresholdResults, input_dir: Path) -> Dict[
     return lookup
 
 
+def _record_has_preview_sources(record: StudyRecord) -> bool:
+    for subject_map in record.replicate_lookup.values():
+        if subject_map:
+            return True
+    if record.preview_plane_root is None or not _preview_root_has_npy_planes(record.preview_plane_root):
+        discovered_root = _discover_preview_plane_root(record.study_id)
+        if discovered_root is not None:
+            record.preview_plane_root = discovered_root
+    if _preview_root_has_npy_planes(record.preview_plane_root):
+        return True
+    raw_dir = PREVIEW_ROOT / record.study_id / "raw"
+    if raw_dir.exists():
+        try:
+            next(raw_dir.glob("*.png"))
+            return True
+        except StopIteration:
+            pass
+        except Exception:
+            pass
+    return False
+
+
+def study_has_preview_sources(study_id: str) -> bool:
+    record = _get_record(study_id)
+    return _record_has_preview_sources(record)
+
+
 def _detect_pixel_size_from_dir(input_dir: Path) -> Optional[float]:
     try:
         nd2_files = find_nd2_files(input_dir)
@@ -393,7 +521,12 @@ def _detect_pixel_size_from_dir(input_dir: Path) -> Optional[float]:
 
 
 def _metric_definitions(record: StudyRecord) -> List[Dict[str, object]]:
-    metrics = [dict(defn) for defn in CHANNEL_METRICS]
+    metrics: List[Dict[str, object]] = []
+    for defn in CHANNEL_METRICS:
+        metric = dict(defn)
+        channel = int(metric.get("channel", 1))
+        metric["label"] = _channel_area_label(record, channel)
+        metrics.append(metric)
     for ratio in record.ratio_definitions:
         metrics.append(
             {
@@ -433,21 +566,61 @@ def _get_record(study_id: str) -> StudyRecord:
         raise HTTPException(status_code=404, detail=f"Study not loaded: {study_id}") from exc
 
 
-def analyze_study(study_id: str, request: AnalyzeRequest) -> AnalyzeResponse:
-    record = _get_record(study_id)
-    thresholds = _threshold_dict(request.thresholds)
+def _analysis_cache_key(thresholds: Dict[str, int]) -> str:
+    return f"{thresholds['channel_1']}-{thresholds['channel_2']}-{thresholds['channel_3']}"
+
+
+def _statistics_cache_key(thresholds: Dict[str, int], request: StatisticsRequest) -> str:
+    pairs = request.comparison_pairs or []
+    pairs_token = "|".join(
+        "::".join(sorted((str(pair[0]), str(pair[1]))))
+        for pair in sorted((pair for pair in pairs if len(pair) == 2), key=lambda pair: tuple(sorted(pair)))
+    ) or "none"
+    reference_group = request.reference_group or "none"
+    return (
+        f"{_analysis_cache_key(thresholds)}|{request.comparison_mode}|{reference_group}|"
+        f"{pairs_token}|{request.test_type}|{request.significance_display}"
+    )
+
+
+def _analysis_tables_for_thresholds(
+    record: StudyRecord,
+    thresholds: Dict[str, int],
+) -> Tuple[pd.DataFrame, List[IndividualImageRecord]]:
+    cache_key = _analysis_cache_key(thresholds)
+    cached = record.analysis_cache.get(cache_key)
+    if cached:
+        cached_mouse = cached.get("mouse_averages")
+        cached_images = cached.get("individual_images")
+        if isinstance(cached_mouse, pd.DataFrame) and isinstance(cached_images, list):
+            return cached_mouse, cached_images
 
     mouse_averages_df = record.results.get_mouse_averages(thresholds)
     _ensure_ratio_columns(mouse_averages_df, record.ratio_definitions)
+    individual_images = _collect_replicate_metrics(record.results.image_data, thresholds, record.ratio_definitions)
+    record.analysis_cache[cache_key] = {
+        "mouse_averages": mouse_averages_df,
+        "individual_images": individual_images,
+    }
+    return mouse_averages_df, individual_images
+
+
+def analyze_study(study_id: str, request: AnalyzeRequest) -> AnalyzeResponse:
+    record = _get_record(study_id)
+    thresholds = _threshold_dict(request.thresholds)
+    uses_ratio_metrics = True
+    mouse_averages_df, individual_images = _analysis_tables_for_thresholds(record, thresholds)
+
     mouse_records: List[MouseAverageRecord] = []
     for row in mouse_averages_df.to_dict(orient="records"):
         ch1 = float(row.get("Channel_1_area", 0.0))
         ch2 = float(row.get("Channel_2_area", 0.0))
         ch3 = float(row.get("Channel_3_area", 0.0))
         ratio_values: Dict[str, float] = {}
-        for ratio in record.ratio_definitions:
-            value = float(row.get(ratio["id"], 0.0))
-            ratio_values[ratio["id"]] = value
+        if uses_ratio_metrics:
+            for ratio in record.ratio_definitions:
+                value = float(row.get(ratio["id"], 0.0))
+                ratio_values[ratio["id"]] = value
         mouse_records.append(
             MouseAverageRecord(
                 Group=str(row.get("Group", "")),
@@ -458,8 +631,6 @@ def analyze_study(study_id: str, request: AnalyzeRequest) -> AnalyzeResponse:
                 ratios=ratio_values,
             )
         )
-
-    individual_images = _collect_replicate_metrics(record.results.image_data, thresholds, record.ratio_definitions)
 
     return AnalyzeResponse(
         study_id=study_id,
@@ -507,12 +678,192 @@ def _collect_replicate_metrics(
     return records
 
 
+def _resolve_source_image_path(record: StudyRecord, mouse_id: str, filename: str) -> Optional[Path]:
+    direct = record.replicate_lookup.get(mouse_id, {}).get(filename)
+    if direct and direct.exists():
+        return direct
+    for subject_map in record.replicate_lookup.values():
+        candidate = subject_map.get(filename)
+        if candidate and candidate.exists():
+            return candidate
+    return None
+
+
+def _entry_has_channel_source(record: StudyRecord, group: str, subject_id: str, filename: str) -> bool:
+    source_path = _resolve_source_image_path(record, subject_id, filename)
+    if source_path is not None and source_path.exists():
+        return True
+
+    if record.preview_plane_root is None or not _preview_root_has_npy_planes(record.preview_plane_root):
+        discovered_root = _discover_preview_plane_root(record.study_id)
+        if discovered_root is not None:
+            record.preview_plane_root = discovered_root
+
+    if record.preview_plane_root:
+        plane_dir = record.preview_plane_root / "planes"
+        if plane_dir.exists():
+            for channel_index in (1, 2, 3):
+                plane_path = plane_dir / preview_plane_filename(group, subject_id, filename, channel_index)
+                if plane_path.exists():
+                    return True
+
+    raw_dir = PREVIEW_ROOT / record.study_id / "raw"
+    if raw_dir.exists():
+        safe_base = f"{slugify(group)}_{slugify(subject_id)}_{slugify(filename)}"
+        for channel_index in (1, 2, 3):
+            if (raw_dir / f"{safe_base}_raw_ch{channel_index}.png").exists():
+                return True
+    return False
+
+
+def _apply_optional_denoise(channel: np.ndarray, sigma: Optional[float]) -> np.ndarray:
+    if sigma is None:
+        return channel.astype(np.float32, copy=False)
+    try:
+        from scipy.ndimage import gaussian_filter
+    except Exception:
+        return channel.astype(np.float32, copy=False)
+    return gaussian_filter(channel.astype(np.float32, copy=False), sigma=sigma)
+
+
+def _positive_intensity(channel: np.ndarray, threshold: int) -> float:
+    if channel is None:
+        return 0.0
+    array = np.asarray(channel, dtype=np.float32)
+    positive = array[array > float(threshold)]
+    if positive.size == 0:
+        return 0.0
+    return float(np.sum(positive))
+
+
+def _colocalization_intensity_metric(
+    channel_a: np.ndarray, channel_b: np.ndarray, threshold_a: int, threshold_b: int
+) -> float:
+    a = np.asarray(channel_a, dtype=np.float32)
+    b = np.asarray(channel_b, dtype=np.float32)
+    mask = (a > float(threshold_a)) | (b > float(threshold_b))
+    if not np.any(mask):
+        return 0.0
+    values_a = a[mask].ravel()
+    values_b = b[mask].ravel()
+    if values_a.size < 3:
+        return 0.0
+    std_a = float(np.std(values_a))
+    std_b = float(np.std(values_b))
+    if std_a < 1e-8 or std_b < 1e-8:
+        return 0.0
+    corr = float(np.corrcoef(values_a, values_b)[0, 1])
+    if not np.isfinite(corr):
+        return 0.0
+    return corr
+
+
+def _colocalization_overlap_metric(
+    channel_a: np.ndarray, channel_b: np.ndarray, threshold_a: int, threshold_b: int
+) -> float:
+    a = np.asarray(channel_a)
+    b = np.asarray(channel_b)
+    mask_a = a > float(threshold_a)
+    mask_b = b > float(threshold_b)
+    union = np.logical_or(mask_a, mask_b)
+    union_count = int(np.sum(union))
+    if union_count == 0:
+        return 0.0
+    intersection_count = int(np.sum(np.logical_and(mask_a, mask_b)))
+    return float((intersection_count / union_count) * 100.0)
+
+
+def _collect_replicate_mode_metrics(
+    record: StudyRecord,
+    thresholds: Dict[str, int],
+    ratio_definitions: List[Dict[str, object]],
+    analysis_mode: str,
+    denoise_sigma: Optional[float],
+) -> List[IndividualImageRecord]:
+    records: List[IndividualImageRecord] = []
+    replicate_counters: Counter[Tuple[str, str]] = Counter()
+    stack_modes = {"positive_intensity_stack_sum", "coloc_intensity_3d", "coloc_overlap_3d"}
+    projection = "none" if analysis_mode in stack_modes else "max"
+    uses_ratio_metrics = analysis_mode.startswith("positive_")
+
+    for entry in record.results.image_data:
+        source_path = _resolve_source_image_path(record, entry.mouse_id, entry.filename)
+        if source_path is None:
+            continue
+
+        try:
+            ch1, ch2, ch3 = load_nd2_file(str(source_path), is_3d=record.is_3d, projection=projection)
+        except Exception:
+            continue
+
+        channels = {
+            1: _apply_optional_denoise(np.asarray(ch1), denoise_sigma),
+            2: _apply_optional_denoise(np.asarray(ch2), denoise_sigma),
+            3: _apply_optional_denoise(np.asarray(ch3), denoise_sigma),
+        }
+
+        if analysis_mode.startswith("positive_intensity_"):
+            channel_values = {
+                1: _positive_intensity(channels[1], thresholds["channel_1"]),
+                2: _positive_intensity(channels[2], thresholds["channel_2"]),
+                3: _positive_intensity(channels[3], thresholds["channel_3"]),
+            }
+        elif analysis_mode.startswith("coloc_intensity_"):
+            channel_values = {
+                1: _colocalization_intensity_metric(channels[1], channels[2], thresholds["channel_1"], thresholds["channel_2"]),
+                2: _colocalization_intensity_metric(channels[1], channels[3], thresholds["channel_1"], thresholds["channel_3"]),
+                3: _colocalization_intensity_metric(channels[2], channels[3], thresholds["channel_2"], thresholds["channel_3"]),
+            }
+        elif analysis_mode.startswith("coloc_overlap_"):
+            channel_values = {
+                1: _colocalization_overlap_metric(channels[1], channels[2], thresholds["channel_1"], thresholds["channel_2"]),
+                2: _colocalization_overlap_metric(channels[1], channels[3], thresholds["channel_1"], thresholds["channel_3"]),
+                3: _colocalization_overlap_metric(channels[2], channels[3], thresholds["channel_2"], thresholds["channel_3"]),
+            }
+        else:
+            channel_values = {
+                1: float(entry.get_percentage_at_threshold(1, thresholds["channel_1"])),
+                2: float(entry.get_percentage_at_threshold(2, thresholds["channel_2"])),
+                3: float(entry.get_percentage_at_threshold(3, thresholds["channel_3"])),
+            }
+
+        ratio_values: Dict[str, float] = {}
+        if uses_ratio_metrics:
+            for ratio in ratio_definitions:
+                num_idx = int(ratio["numerator_channel"])
+                den_idx = int(ratio["denominator_channel"])
+                numerator = channel_values.get(num_idx, 0.0)
+                denominator = channel_values.get(den_idx, 0.0)
+                ratio_values[ratio["id"]] = float(numerator / (denominator + 1e-6))
+
+        key = (entry.group, entry.mouse_id)
+        replicate_counters[key] += 1
+        replicate_index = replicate_counters[key]
+        records.append(
+            IndividualImageRecord(
+                group=str(entry.group),
+                mouse_id=str(entry.mouse_id),
+                filename=str(entry.filename),
+                channel_1_area=float(channel_values.get(1, 0.0)),
+                channel_2_area=float(channel_values.get(2, 0.0)),
+                channel_3_area=float(channel_values.get(3, 0.0)),
+                ratios=ratio_values,
+                replicate_index=replicate_index,
+            )
+        )
+
+    return records
+
+
 def perform_statistics(study_id: str, request: StatisticsRequest) -> StatisticsResponse:
     record = _get_record(study_id)
     thresholds = _threshold_dict(request.thresholds)
-
-    mouse_averages_df = record.results.get_mouse_averages(thresholds)
-    _ensure_ratio_columns(mouse_averages_df, record.ratio_definitions)
+    cache_key = _statistics_cache_key(thresholds, request)
+    cached = record.statistics_cache.get(cache_key)
+    if isinstance(cached, StatisticsResponse):
+        return cached
+    uses_ratio_metrics = True
+    mouse_averages_df, _ = _analysis_tables_for_thresholds(record, thresholds)
 
     channels = [
         ("channel_1", "Channel_1_area"),
@@ -536,28 +887,31 @@ def perform_statistics(study_id: str, request: StatisticsRequest) -> StatisticsR
             request.significance_display,
         )
 
-    for ratio in record.ratio_definitions:
-        column = ratio["id"]
-        groups_data = {
-            group: group_df[column].dropna().tolist()
-            for group, group_df in mouse_averages_df.groupby("Group")
-        }
-        statistics[column] = _analyze_groups(
-            groups_data,
-            request.comparison_mode,
-            request.reference_group,
-            request.comparison_pairs,
-            request.test_type,
-            request.significance_display,
-        )
+    if uses_ratio_metrics:
+        for ratio in record.ratio_definitions:
+            column = ratio["id"]
+            groups_data = {
+                group: group_df[column].dropna().tolist()
+                for group, group_df in mouse_averages_df.groupby("Group")
+            }
+            statistics[column] = _analyze_groups(
+                groups_data,
+                request.comparison_mode,
+                request.reference_group,
+                request.comparison_pairs,
+                request.test_type,
+                request.significance_display,
+            )
 
-    return StatisticsResponse(
+    response = StatisticsResponse(
         statistics=statistics,
         thresholds=thresholds,
         test_type_used=request.test_type,
         significance_display=request.significance_display,
         ratios=record.ratio_definitions,
     )
+    record.statistics_cache[cache_key] = response
+    return response
 
 
 def _analyze_groups(
@@ -764,13 +1118,7 @@ ALL_PREVIEW_METRICS: Tuple[str, ...] = (
 DEFAULT_PREVIEW_METRIC = ALL_PREVIEW_METRICS[0]
 DEFAULT_PANEL_ORDER: Tuple[str, ...] = ("channel_1", "channel_2", "channel_3", "composite")
 
-GRAPH_PAD_EXPORT_ORDER: Tuple[Tuple[str, str], ...] = (
-    ("Channel_1_area", "Channel 1"),
-    ("Channel_2_area", "Channel 2"),
-    ("Channel_3_area", "Channel 3"),
-    ("Channel_1_3_ratio", "Channel 1 / Channel 3"),
-    ("Channel_2_3_ratio", "Channel 2 / Channel 3"),
-)
+GRAPH_PAD_EXPORT_KEYS: Tuple[str, ...] = ("Channel_1_area", "Channel_2_area", "Channel_3_area")
 
 
 class PreviewVariant(NamedTuple):
@@ -878,15 +1226,98 @@ def _normalize_channel_ranges(payload: Optional[Dict[str, object]]) -> Dict[int,
     return normalized
 
 
-def _channel_range_token(channel_ranges: Dict[int, Tuple[float, float]]) -> str:
-    if not channel_ranges:
-        return "default"
+def _normalize_channel_ids(channel_ids: Optional[Iterable[int]] = None) -> Tuple[int, ...]:
+    if channel_ids is None:
+        return (1, 2, 3)
+    normalized = sorted({int(channel_id) for channel_id in channel_ids if int(channel_id) in {1, 2, 3}})
+    return tuple(normalized) or (1, 2, 3)
+
+
+def _channel_range_token(
+    channel_ranges: Dict[int, Tuple[float, float]],
+    channel_ids: Optional[Iterable[int]] = None,
+) -> str:
+    active_channels = _normalize_channel_ids(channel_ids)
     parts = []
-    for channel_index in sorted(channel_ranges):
-        vmin, vmax = channel_ranges[channel_index]
+    for channel_index in active_channels:
+        bounds = channel_ranges.get(channel_index)
+        if bounds is None:
+            continue
+        vmin, vmax = bounds
         parts.append(f"{channel_index}:{int(vmin)}-{int(vmax)}")
+    if not parts:
+        return "default"
     digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:10]
     return f"rng-{digest}"
+
+
+def _channel_color_token(
+    channel_definitions: List[Dict[str, object]],
+    channel_ids: Optional[Iterable[int]] = None,
+) -> str:
+    active_channels = _normalize_channel_ids(channel_ids)
+    normalized = normalize_channel_definitions(channel_definitions)
+    defaults = normalize_channel_definitions(DEFAULT_CHANNEL_DEFINITIONS)
+    normalized_map = {int(entry["channel"]): entry for entry in normalized}
+    default_map = {int(entry["channel"]): entry for entry in defaults}
+    parts = []
+    for channel_index in active_channels:
+        current = normalized_map.get(channel_index)
+        default = default_map.get(channel_index)
+        if current is None or default is None:
+            continue
+        if current == default:
+            continue
+        parts.append(f"{channel_index}:{current['color']}")
+    if not parts:
+        return "default"
+    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:10]
+    return f"clr-{digest}"
+
+
+def _preview_style_token(
+    channel_ranges: Dict[int, Tuple[float, float]],
+    channel_definitions: List[Dict[str, object]],
+    channel_ids: Optional[Iterable[int]] = None,
+) -> str:
+    range_token = _channel_range_token(channel_ranges, channel_ids)
+    color_token = _channel_color_token(channel_definitions, channel_ids)
+    if range_token == "default" and color_token == "default":
+        return "default"
+    digest = hashlib.sha1(f"{range_token}|{color_token}".encode("utf-8")).hexdigest()[:10]
+    return f"style-{digest}"
+
+
+def _threshold_dependency_token(
+    thresholds: Dict[str, int],
+    channel_ids: Optional[Iterable[int]] = None,
+) -> str:
+    active_channels = _normalize_channel_ids(channel_ids)
+    if not active_channels:
+        return "default"
+    parts = [f"{channel_index}:{thresholds.get(f'channel_{channel_index}', 0)}" for channel_index in active_channels]
+    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:10]
+    return f"thr-{digest}"
+
+
+def _preview_dependency_token(
+    thresholds: Dict[str, int],
+    channel_ranges: Dict[int, Tuple[float, float]],
+    channel_definitions: List[Dict[str, object]],
+    variant: PreviewVariant,
+) -> str:
+    active_channels = variant.channels or _normalize_channel_ids()
+    tokens: List[str] = []
+    if variant.variant in {"mask", "overlay"}:
+        tokens.append(_threshold_dependency_token(thresholds, active_channels))
+    if variant.variant in {"raw", "overlay"}:
+        tokens.append(_channel_range_token(channel_ranges, active_channels))
+    tokens.append(_channel_color_token(channel_definitions, active_channels))
+    non_default = [token for token in tokens if token != "default"]
+    if not non_default:
+        return "default"
+    digest = hashlib.sha1("|".join(non_default).encode("utf-8")).hexdigest()[:10]
+    return f"dep-{digest}"
 
 
 def _visualizer_range_payload(channel_ranges: Dict[int, Tuple[float, float]]) -> Dict[str, Dict[str, float]]:
@@ -897,24 +1328,31 @@ def _visualizer_range_payload(channel_ranges: Dict[int, Tuple[float, float]]) ->
 
 
 def _build_variant_cache_key(
-    cache_base: str, variant: PreviewVariant, threshold_key: str, metric: str, range_token: str
+    cache_base: str,
+    variant: PreviewVariant,
+    metric: str,
+    dependency_token: str,
 ) -> str:
     channel_tag = "-".join(str(ch) for ch in variant.channels) or "all"
-    token = range_token or "default"
+    token = dependency_token or "default"
     if variant.cacheable:
         return f"{cache_base}|{variant.variant}|{channel_tag}|{token}"
-    return f"{cache_base}|{threshold_key}|{metric}|{variant.variant}|{channel_tag}|{token}"
+    return f"{cache_base}|{metric}|{variant.variant}|{channel_tag}|{token}"
 
 
 def _build_variant_filename(
-    safe_base: str, variant: PreviewVariant, metric_slug: str, cacheable: bool, range_token: str
+    safe_base: str,
+    variant: PreviewVariant,
+    metric_slug: str,
+    cacheable: bool,
+    dependency_token: str,
 ) -> str:
     channel_tag = "-".join(f"ch{ch}" for ch in variant.channels) or "all"
     parts = [safe_base, variant.variant, channel_tag]
     if not cacheable:
         parts.append(metric_slug)
-    if range_token and range_token != "default":
-        parts.append(range_token)
+    if dependency_token and dependency_token != "default":
+        parts.append(dependency_token)
     return "_".join(parts) + ".png"
 
 
@@ -932,13 +1370,13 @@ def _metadata_path_for(image_path: Path) -> Path:
     return Path(str(image_path) + ".meta.json")
 
 
-def _write_preview_metadata(image_path: Path, metric_id: str, variant: PreviewVariant, range_token: str) -> None:
+def _write_preview_metadata(image_path: Path, metric_id: str, variant: PreviewVariant, dependency_token: str) -> None:
     metadata = {
         "variant": variant.variant,
         "channels": list(variant.channels),
         "cache_scope": "global" if variant.cacheable else metric_id,
         "updated_at": datetime.utcnow().isoformat() + "Z",
-        "range_token": range_token or "default",
+        "dependency_token": dependency_token or "default",
     }
     meta_path = _metadata_path_for(image_path)
     try:
@@ -949,7 +1387,7 @@ def _write_preview_metadata(image_path: Path, metric_id: str, variant: PreviewVa
             meta_path.unlink(missing_ok=True)
 
 
-def _metadata_matches(image_path: Path, metric_id: str, variant: PreviewVariant, range_token: str) -> bool:
+def _metadata_matches(image_path: Path, metric_id: str, variant: PreviewVariant, dependency_token: str) -> bool:
     meta_path = _metadata_path_for(image_path)
     if not meta_path.exists():
         return False
@@ -964,15 +1402,22 @@ def _metadata_matches(image_path: Path, metric_id: str, variant: PreviewVariant,
         return False
     if data.get("cache_scope") != expected_scope:
         return False
-    stored_token = data.get("range_token", "default")
-    return stored_token == (range_token or "default")
+    stored_token = data.get("dependency_token", data.get("range_token", "default"))
+    return stored_token == (dependency_token or "default")
 
 
-def _cached_variant_valid(path: Path, metric_id: str, variant: PreviewVariant, range_token: str) -> bool:
+def _cached_variant_valid(path: Path, metric_id: str, variant: PreviewVariant, dependency_token: str) -> bool:
     path = Path(path)
     if not _is_valid_preview_file(path):
         return False
-    return _metadata_matches(path, metric_id, variant, range_token)
+    return _metadata_matches(path, metric_id, variant, dependency_token)
+
+
+def _preview_cache_token(path: Path) -> str:
+    try:
+        return str(path.stat().st_mtime_ns)
+    except OSError:
+        return "0"
 
 
 def _prune_preview_thresholds(preview_dir: Path, retain_keys: Set[str], max_sets: int = 5, max_age_days: int = 7) -> None:
@@ -980,7 +1425,10 @@ def _prune_preview_thresholds(preview_dir: Path, retain_keys: Set[str], max_sets
         candidates = [
             child
             for child in preview_dir.iterdir()
-            if child.is_dir() and child.name not in {"raw", "planes"} and child.name not in retain_keys
+            if child.is_dir()
+            and child.name not in {"raw", "planes"}
+            and child.name not in retain_keys
+            and not _preview_root_has_npy_planes(child)
         ]
     except FileNotFoundError:
         return
@@ -1045,6 +1493,16 @@ def clear_preview_cache(study_id: str, scope: str = "thresholds", threshold_key:
     return PreviewClearResponse(removed_directories=removed)
 
 
+def _set_latest_preview_revision(study_id: str, revision_key: str) -> None:
+    with _PREVIEW_REVISION_LOCK:
+        _PREVIEW_LATEST_REVISION[study_id] = revision_key
+
+
+def _is_latest_preview_revision(study_id: str, revision_key: str) -> bool:
+    with _PREVIEW_REVISION_LOCK:
+        return _PREVIEW_LATEST_REVISION.get(study_id) == revision_key
+
+
 def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse:
     record = _get_record(study_id)
     thresholds = _threshold_dict(request.thresholds)
@@ -1053,12 +1511,11 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
 
     preview_dir = ensure_directory(PREVIEW_ROOT / study_id)
     raw_dir = ensure_directory(preview_dir / "raw")
-    if record.preview_plane_root is None:
-        record.preview_plane_root = preview_dir
-    else:
-        try:
-            ensure_directory(record.preview_plane_root / "planes")
-        except Exception:
+    if record.preview_plane_root is None or not _preview_root_has_npy_planes(record.preview_plane_root):
+        discovered_root = _discover_preview_plane_root(study_id)
+        if discovered_root is not None:
+            record.preview_plane_root = discovered_root
+        elif record.preview_plane_root is None:
             record.preview_plane_root = preview_dir
 
     threshold_key = f"{thresholds['channel_1']}-{thresholds['channel_2']}-{thresholds['channel_3']}"
@@ -1073,83 +1530,133 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
 
     groups_requested = set(request.groups) if request.groups else None
     channel_ranges = _normalize_channel_ranges(request.channel_ranges)
-    range_token = _channel_range_token(channel_ranges)
+    style_token = _preview_style_token(channel_ranges, record.channel_definitions)
+    revision_key = request.revision_key or f"{threshold_key}|{style_token}"
+    _set_latest_preview_revision(study_id, revision_key)
     group_counts: Dict[str, int] = defaultdict(int)
-    group_subjects: Dict[str, Set[str]] = defaultdict(set)
+    group_items_seen: Dict[str, Set[str]] = defaultdict(set)
     per_group_limits: Dict[str, int] = {
-        group: max(1, min(6, int(value)))
+        group: max(1, min(20, int(value)))
         for group, value in (request.group_sample_limits or {}).items()
         if isinstance(value, int)
     }
-    max_samples = max(1, min(6, request.max_samples_per_group))
-    nd2_available = record.input_dir.exists()
+    max_samples = max(1, min(20, request.max_samples_per_group))
+    nd2_available = _record_has_preview_sources(record)
     preview_images: List[PreviewImage] = []
-
-    for entry in record.results.image_data:
+    priority_keys: Set[Tuple[str, str, str]] = set()
+    priority_entries: List[ThresholdData] = []
+    if request.priority_subjects:
+        entry_lookup: Dict[Tuple[str, str, str], ThresholdData] = {
+            (entry.group, entry.mouse_id, entry.filename): entry for entry in record.results.image_data
+        }
+        for subject in request.priority_subjects:
+            key = (subject.group, subject.subject_id, subject.filename)
+            if key in priority_keys:
+                continue
+            match = entry_lookup.get(key)
+            if match is None:
+                continue
+            priority_keys.add(key)
+            priority_entries.append(match)
+    ordered_entries: List[ThresholdData] = priority_entries + [
+        entry for entry in record.results.image_data if (entry.group, entry.mouse_id, entry.filename) not in priority_keys
+    ]
+    stale_request = False
+    for entry in ordered_entries:
+        if not _is_latest_preview_revision(study_id, revision_key):
+            stale_request = True
+            break
         if groups_requested and entry.group not in groups_requested:
             continue
         limit = per_group_limits.get(entry.group, max_samples)
-        subjects_seen = group_subjects[entry.group]
-        if entry.mouse_id in subjects_seen:
+        item_key = f"{entry.mouse_id}|{entry.filename}"
+        items_seen = group_items_seen[entry.group]
+        if item_key in items_seen:
             continue
-        if len(subjects_seen) >= limit:
+        if len(items_seen) >= limit:
             continue
 
         cache_base = f"{entry.group}|{entry.mouse_id}|{entry.filename}"
         safe_base = f"{slugify(entry.group)}_{slugify(entry.mouse_id)}_{slugify(entry.filename)}"
         channel_arrays: Optional[Dict[int, np.ndarray]] = None
+        generated_for_entry = False
 
         for metric_id in metric_ids:
+            if not _is_latest_preview_revision(study_id, revision_key):
+                stale_request = True
+                break
             variant_plan = variant_plans[metric_id]
             metric_dir = metric_dirs[metric_id]
             metric_slug = metric_slugs[metric_id]
             existing_files: Dict[str, Path] = {}
 
             for variant in variant_plan:
-                cacheable_variant = variant.cacheable and not channel_ranges
-                cache_key = _build_variant_cache_key(cache_base, variant, threshold_key, metric_id, range_token)
+                if not _is_latest_preview_revision(study_id, revision_key):
+                    stale_request = True
+                    break
+                cacheable_variant = variant.cacheable
+                dependency_token = _preview_dependency_token(
+                    thresholds,
+                    channel_ranges,
+                    record.channel_definitions,
+                    variant,
+                )
+                cache_key = _build_variant_cache_key(cache_base, variant, metric_id, dependency_token)
                 output_dir = raw_dir if cacheable_variant else metric_dir
-                safe_name = _build_variant_filename(safe_base, variant, metric_slug, cacheable_variant, range_token)
+                safe_name = _build_variant_filename(safe_base, variant, metric_slug, cacheable_variant, dependency_token)
                 image_path = output_dir / safe_name
 
-                cached_path = record.preview_cache.get(cache_key) if cacheable_variant else None
-                if cacheable_variant and cached_path and _cached_variant_valid(cached_path, metric_id, variant, range_token):
+                cached_path = record.preview_cache.get(cache_key)
+                if cached_path and _cached_variant_valid(cached_path, metric_id, variant, dependency_token):
                     existing_files[cache_key] = cached_path
                     continue
 
-                if cacheable_variant is False:
-                    # Non-cacheable variants (mask/overlay) must refresh whenever the LUT changes.
-                    if _cached_variant_valid(image_path, metric_id, variant, range_token) and range_token == "default":
-                        existing_files[cache_key] = image_path
-                        continue
-                else:
-                    if _cached_variant_valid(image_path, metric_id, variant, range_token):
-                        existing_files[cache_key] = image_path
-                        record.preview_cache[cache_key] = image_path
-                        continue
+                if _cached_variant_valid(image_path, metric_id, variant, dependency_token):
+                    existing_files[cache_key] = image_path
+                    record.preview_cache[cache_key] = image_path
+                    continue
 
                 if channel_arrays is None:
+                    allow_source_read = not bool(request.prefer_generated_assets)
                     channel_arrays = _load_channels(
-                        record, entry.group, entry.mouse_id, entry.filename, allow_png_fallback=False
+                        record,
+                        entry.group,
+                        entry.mouse_id,
+                        entry.filename,
+                        allow_png_fallback=True,
+                        allow_source_read=allow_source_read,
                     )
                 if not channel_arrays:
                     continue
 
-                image_array = _render_preview_variant(channel_arrays, thresholds, variant, channel_ranges)
+                image_array = _render_preview_variant(
+                    channel_arrays,
+                    thresholds,
+                    variant,
+                    channel_ranges,
+                    record.channel_definitions,
+                )
                 if image_array is None:
                     continue
 
                 _write_image(image_array, image_path)
-                _write_preview_metadata(image_path, metric_id, variant, range_token)
-                if cacheable_variant:
-                    record.preview_cache[cache_key] = image_path
+                _write_preview_metadata(image_path, metric_id, variant, dependency_token)
+                record.preview_cache[cache_key] = image_path
                 existing_files[cache_key] = image_path
+            if stale_request:
+                break
 
             if not existing_files:
                 continue
 
             for variant in variant_plan:
-                cache_key = _build_variant_cache_key(cache_base, variant, threshold_key, metric_id, range_token)
+                dependency_token = _preview_dependency_token(
+                    thresholds,
+                    channel_ranges,
+                    record.channel_definitions,
+                    variant,
+                )
+                cache_key = _build_variant_cache_key(cache_base, variant, metric_id, dependency_token)
                 image_path = existing_files.get(cache_key)
                 if not image_path:
                     continue
@@ -1163,11 +1670,19 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
                         subject_id=entry.mouse_id,
                         filename=entry.filename,
                         image_path=str(image_path),
+                        cache_token=_preview_cache_token(image_path),
                     )
                 )
+                generated_for_entry = True
+        if stale_request:
+            break
 
-        group_subjects[entry.group].add(entry.mouse_id)
-        group_counts[entry.group] = len(group_subjects[entry.group])
+        if generated_for_entry:
+            group_items_seen[entry.group].add(item_key)
+            group_counts[entry.group] = len(group_items_seen[entry.group])
+
+    if stale_request:
+        LOGGER.debug("Cancelled stale preview generation for study %s revision %s", study_id, revision_key)
 
     metric_rank = {metric["id"]: index for index, metric in enumerate(metric_defs)}
     preview_images.sort(
@@ -1181,6 +1696,7 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
     )
 
     group_sample_counts = dict(group_counts)
+    nd2_available = nd2_available or bool(preview_images)
 
     return PreviewResponse(
         study_id=study_id,
@@ -1209,7 +1725,7 @@ def render_preview_panel(study_id: str, request: PreviewDownloadRequest) -> Prev
         allow_png_fallback=False,
     )
     if not channel_arrays:
-        raise HTTPException(status_code=404, detail="ND2 data unavailable for the requested preview.")
+        raise HTTPException(status_code=404, detail="Source image data unavailable for the requested preview.")
 
     def _project(channel_id: int) -> Optional[np.ndarray]:
         array = channel_arrays.get(channel_id)
@@ -1230,14 +1746,16 @@ def render_preview_panel(study_id: str, request: PreviewDownloadRequest) -> Prev
     file_name = f"{slugify(request.group)}_{slugify(request.subject_id)}_{timestamp}.png"
     target_path = panel_dir / file_name
 
-    vis_config = VisualizationConfig(scale_bar_um=request.scale_bar_um or 50)
-    visualizer = ND2Visualizer(vis_config, pixel_size_um=record.pixel_size_um)
+    requested_scale_bar = request.scale_bar_um
+    add_scale_bar = requested_scale_bar is None or requested_scale_bar > 0
+    vis_config = VisualizationConfig(scale_bar_um=requested_scale_bar or 50)
+    visualizer = ND2Visualizer(vis_config, pixel_size_um=record.pixel_size_um, channel_definitions=record.channel_definitions)
     figure = visualizer.visualize_channels(
         channel_1,
         channel_2,
         channel_3,
         save_path=str(target_path),
-        add_scale_bar=True,
+        add_scale_bar=add_scale_bar,
         panel_order=panel_order,
         channel_ranges=visualizer_ranges,
     )
@@ -1254,12 +1772,30 @@ def list_ratio_definitions(study_id: str) -> List[Dict[str, object]]:
     return record.ratio_definitions
 
 
+def list_channel_definitions(study_id: str) -> List[Dict[str, object]]:
+    record = _get_record(study_id)
+    return record.channel_definitions
+
+
 def update_ratio_definitions(study_id: str, ratios: List[Dict[str, object]]) -> List[Dict[str, object]]:
     record = _get_record(study_id)
     normalized = normalize_ratio_definitions(ratios)
     record.ratio_definitions = normalized
+    record.results.ratio_definitions = normalized
     record.preview_cache.clear()
-    _persist_ratio_metadata(record)
+    record.analysis_cache.clear()
+    record.statistics_cache.clear()
+    _persist_study_annotations(record)
+    return normalized
+
+
+def update_channel_definitions(study_id: str, channels: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    record = _get_record(study_id)
+    normalized = normalize_channel_definitions(channels)
+    record.channel_definitions = normalized
+    record.results.channel_definitions = normalized
+    record.preview_cache.clear()
+    _persist_study_annotations(record)
     return normalized
 
 
@@ -1268,42 +1804,58 @@ def update_pixel_size(study_id: str, pixel_size_um: Optional[float]) -> Optional
     if pixel_size_um is not None and pixel_size_um <= 0:
         raise HTTPException(status_code=400, detail="Pixel size must be positive.")
     record.pixel_size_um = float(pixel_size_um) if pixel_size_um else None
-    _persist_pixel_metadata(record)
+    record.results.pixel_size_um = record.pixel_size_um
+    _persist_study_annotations(record)
     return record.pixel_size_um
 
 
-def _persist_ratio_metadata(record: StudyRecord) -> None:
-    meta_path = Path(str(record.source_path) + ".meta.json")
+def _load_json_payload(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        return {}
     try:
-        if meta_path.exists():
-            payload = json.loads(meta_path.read_text())
-        else:
-            payload = {}
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _write_json_payload(path: Path, payload: Dict[str, object]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def _persist_study_annotations(record: StudyRecord) -> None:
+    _persist_result_annotations(record)
+    _persist_study_metadata(record)
+
+
+def _persist_result_annotations(record: StudyRecord) -> None:
+    result_path = Path(record.source_path)
+    try:
+        payload = _load_json_payload(result_path)
+        if not payload:
+            return
         payload["ratio_definitions"] = record.ratio_definitions
-        if record.input_dir:
-            payload.setdefault("input_dir", str(record.input_dir))
-        if record.preview_plane_root:
-            payload.setdefault("preview_root", str(record.preview_plane_root))
-        with meta_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
+        payload["channel_definitions"] = record.channel_definitions
+        payload["pixel_size_um"] = record.pixel_size_um
+        _write_json_payload(result_path, payload)
     except Exception:
         pass
 
 
-def _persist_pixel_metadata(record: StudyRecord) -> None:
+def _persist_study_metadata(record: StudyRecord) -> None:
     meta_path = Path(str(record.source_path) + ".meta.json")
     try:
-        if meta_path.exists():
-            payload = json.loads(meta_path.read_text())
-        else:
+        payload = _load_json_payload(meta_path)
+        if not payload:
             payload = {}
+        payload["ratio_definitions"] = record.ratio_definitions
+        payload["channel_definitions"] = record.channel_definitions
         payload["pixel_size_um"] = record.pixel_size_um
         if record.input_dir:
             payload.setdefault("input_dir", str(record.input_dir))
         if record.preview_plane_root:
             payload.setdefault("preview_root", str(record.preview_plane_root))
-        with meta_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
+        _write_json_payload(meta_path, payload)
     except Exception:
         pass
 
@@ -1342,7 +1894,11 @@ def _build_graphpad_block(
     return pd.DataFrame(padded), counts
 
 
-def _build_graphpad_dataframe(mouse_df: pd.DataFrame, ratio_defs: List[Dict[str, object]]) -> pd.DataFrame:
+def _build_graphpad_dataframe(
+    mouse_df: pd.DataFrame,
+    ratio_defs: List[Dict[str, object]],
+    channel_defs: List[Dict[str, object]],
+) -> pd.DataFrame:
     if mouse_df.empty:
         return pd.DataFrame()
     group_order = _graphpad_group_order(mouse_df)
@@ -1350,7 +1906,10 @@ def _build_graphpad_dataframe(mouse_df: pd.DataFrame, ratio_defs: List[Dict[str,
         return pd.DataFrame()
     blocks: List[pd.DataFrame] = []
     counts: Dict[str, int] = {}
-    for metric_key, label in GRAPH_PAD_EXPORT_ORDER:
+    channel_map = channel_definition_map(channel_defs)
+    for metric_key in GRAPH_PAD_EXPORT_KEYS:
+        channel_index = int(metric_key.split("_")[1])
+        label = str(channel_map.get(channel_index, {}).get("label", f"Channel {channel_index}"))
         block, block_counts = _build_graphpad_block(mouse_df, metric_key, label, group_order)
         if block is None:
             continue
@@ -1374,19 +1933,27 @@ def _build_graphpad_dataframe(mouse_df: pd.DataFrame, ratio_defs: List[Dict[str,
     return graphpad_df
 
 
-def _format_replicates_dataframe(individual_df: pd.DataFrame, ratios: List[Dict[str, object]]) -> pd.DataFrame:
+def _format_replicates_dataframe(
+    individual_df: pd.DataFrame,
+    ratios: List[Dict[str, object]],
+    channel_defs: List[Dict[str, object]],
+) -> pd.DataFrame:
     if individual_df.empty:
         return individual_df
 
     table = individual_df.copy()
+    channel_map = channel_definition_map(channel_defs)
+    ch1_label = str(channel_map.get(1, {}).get("label", "Channel 1"))
+    ch2_label = str(channel_map.get(2, {}).get("label", "Channel 2"))
+    ch3_label = str(channel_map.get(3, {}).get("label", "Channel 3"))
     rename_map = {
         "group": "Group",
         "mouse_id": "Mouse ID",
         "replicate_index": "Replicate #",
         "filename": "Filename",
-        "channel_1_area": "Channel 1 Area (%)",
-        "channel_2_area": "Channel 2 Area (%)",
-        "channel_3_area": "Channel 3 Area (%)",
+        "channel_1_area": f"{ch1_label} Area (%)",
+        "channel_2_area": f"{ch2_label} Area (%)",
+        "channel_3_area": f"{ch3_label} Area (%)",
         "channel_1_3_ratio": "Channel 1 / Channel 3",
         "channel_2_3_ratio": "Channel 2 / Channel 3",
     }
@@ -1405,9 +1972,9 @@ def _format_replicates_dataframe(individual_df: pd.DataFrame, ratios: List[Dict[
         "Mouse ID",
         "Replicate #",
         "Filename",
-        "Channel 1 Area (%)",
-        "Channel 2 Area (%)",
-        "Channel 3 Area (%)",
+        f"{ch1_label} Area (%)",
+        f"{ch2_label} Area (%)",
+        f"{ch3_label} Area (%)",
     ]
     ordered_columns.extend(ratio_labels)
     existing_columns = [column for column in ordered_columns if column in table.columns]
@@ -1443,8 +2010,8 @@ def generate_downloads(study_id: str, thresholds: Dict[str, int]) -> DownloadRes
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     excel_path = download_dir / f"{study_id}_thresholds_{timestamp}.xlsx"
 
-    graphpad_df = _build_graphpad_dataframe(mouse_averages_df, record.ratio_definitions)
-    replicates_df = _format_replicates_dataframe(individual_images, record.ratio_definitions)
+    graphpad_df = _build_graphpad_dataframe(mouse_averages_df, record.ratio_definitions, record.channel_definitions)
+    replicates_df = _format_replicates_dataframe(individual_images, record.ratio_definitions, record.channel_definitions)
 
     try:
         _write_excel_workbook(excel_path, graphpad_df, mouse_averages_df, replicates_df)
@@ -1538,7 +2105,13 @@ def resolve_download_path(study_id: str, file_path: str) -> Path:
 
 
 def _load_channels(
-    record: StudyRecord, group: str, subject_id: str, filename: str, *, allow_png_fallback: bool = True
+    record: StudyRecord,
+    group: str,
+    subject_id: str,
+    filename: str,
+    *,
+    allow_png_fallback: bool = True,
+    allow_source_read: bool = True,
 ) -> Optional[Dict[int, np.ndarray]]:
     cache_key = f"{group}|{subject_id}|{filename}"
     cached_source = record.raw_cache_source.get(cache_key)
@@ -1551,9 +2124,13 @@ def _load_channels(
             return record.raw_cache[cache_key]
 
     channel_arrays: Dict[int, np.ndarray] = {}
+    if record.preview_plane_root is None or not _preview_root_has_npy_planes(record.preview_plane_root):
+        discovered_root = _discover_preview_plane_root(record.study_id)
+        if discovered_root is not None:
+            record.preview_plane_root = discovered_root
 
     if record.preview_plane_root:
-        plane_dir = ensure_directory(record.preview_plane_root / "planes")
+        plane_dir = record.preview_plane_root / "planes"
         for channel_index in (1, 2, 3):
             plane_path = plane_dir / preview_plane_filename(group, subject_id, filename, channel_index)
             if not plane_path.exists():
@@ -1566,7 +2143,13 @@ def _load_channels(
                 channel_arrays.clear()
                 break
 
-    if not channel_arrays:
+    source_tag = "nd2"
+    if not channel_arrays and allow_png_fallback:
+        channel_arrays = _load_channels_from_cached_png(record, group, subject_id, filename)
+        if channel_arrays:
+            _persist_preview_planes(record, group, subject_id, filename, channel_arrays)
+            source_tag = "png"
+    if not channel_arrays and allow_source_read:
         subject_path: Optional[Path] = None
         for subject_map in record.replicate_lookup.values():
             if filename in subject_map:
@@ -1577,16 +2160,10 @@ def _load_channels(
                 ch1, ch2, ch3 = load_nd2_file(str(subject_path), is_3d=record.is_3d)
                 channel_arrays = {1: ch1, 2: ch2, 3: ch3}
                 _persist_preview_planes(record, group, subject_id, filename, channel_arrays)
+                source_tag = "nd2"
             except Exception:
                 channel_arrays = {}
-
-    source_tag = "nd2"
-    if not channel_arrays and allow_png_fallback:
-        channel_arrays = _load_channels_from_cached_png(record, group, subject_id, filename)
-        if channel_arrays:
-            _persist_preview_planes(record, group, subject_id, filename, channel_arrays)
-            source_tag = "png"
-    elif channel_arrays:
+    elif channel_arrays and source_tag != "png":
         source_tag = "planes" if record.preview_plane_root else "nd2"
 
     if not channel_arrays:
@@ -1664,16 +2241,27 @@ def _normalize_channel(channel: np.ndarray, range_override: Optional[Tuple[float
     return channel.astype(np.uint8)
 
 
-def _generate_raw_image(channels: Dict[int, np.ndarray], channel_ranges: Dict[int, Tuple[float, float]]) -> Optional[np.ndarray]:
-    red_source = channels.get(2) or channels.get(1)
-    green_source = channels.get(1) or channels.get(2)
-    blue_source = channels.get(3) or channels.get(1)
-    if red_source is None or green_source is None or blue_source is None:
+def _generate_raw_image(
+    channels: Dict[int, np.ndarray],
+    channel_ranges: Dict[int, Tuple[float, float]],
+    channel_definitions: List[Dict[str, object]],
+) -> Optional[np.ndarray]:
+    sample = next((array for array in channels.values() if array is not None), None)
+    if sample is None:
         return None
-    red = _normalize_channel(red_source, channel_ranges.get(2))
-    green = _normalize_channel(green_source, channel_ranges.get(1))
-    blue = _normalize_channel(blue_source, channel_ranges.get(3))
-    return np.stack([red, green, blue], axis=-1)
+    rgb = np.zeros((*sample.shape, 3), dtype=np.float32)
+    color_map = channel_definition_map(channel_definitions)
+    for channel_id in (1, 2, 3):
+        source = channels.get(channel_id)
+        if source is None:
+            continue
+        normalized = _normalize_channel(source, channel_ranges.get(channel_id)).astype(np.float32) / 255.0
+        channel_color = str(color_map.get(channel_id, {}).get("color", "#ffffff"))
+        red, green, blue = channel_color_rgb(channel_color)
+        rgb[..., 0] += normalized * red
+        rgb[..., 1] += normalized * green
+        rgb[..., 2] += normalized * blue
+    return (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
 def _build_binary_mask(
@@ -1687,47 +2275,71 @@ def _build_binary_mask(
 
 
 def _generate_channel_raw_image(
-    channels: Dict[int, np.ndarray], channel_id: int, channel_ranges: Dict[int, Tuple[float, float]]
+    channels: Dict[int, np.ndarray],
+    channel_id: int,
+    channel_ranges: Dict[int, Tuple[float, float]],
+    channel_definitions: List[Dict[str, object]],
 ) -> Optional[np.ndarray]:
     channel = channels.get(channel_id)
     if channel is None:
         return None
-    normalized = _normalize_channel(channel, channel_ranges.get(channel_id))
-    zeros = np.zeros_like(normalized)
-    if channel_id == 1:
-        return np.stack([zeros, normalized, zeros], axis=-1)
-    if channel_id == 2:
-        return np.stack([normalized, zeros, zeros], axis=-1)
-    if channel_id == 3:
-        return np.stack([zeros, zeros, normalized], axis=-1)
-    return np.stack([normalized, normalized, normalized], axis=-1)
+    normalized = _normalize_channel(channel, channel_ranges.get(channel_id)).astype(np.float32) / 255.0
+    color_map = channel_definition_map(channel_definitions)
+    channel_color = str(color_map.get(channel_id, {}).get("color", "#ffffff"))
+    red, green, blue = channel_color_rgb(channel_color)
+    rgb = np.zeros((*normalized.shape, 3), dtype=np.float32)
+    rgb[..., 0] = normalized * red
+    rgb[..., 1] = normalized * green
+    rgb[..., 2] = normalized * blue
+    return (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
 def _generate_channel_mask_image(
-    channels: Dict[int, np.ndarray], thresholds: Dict[str, int], channel_id: int
+    channels: Dict[int, np.ndarray],
+    thresholds: Dict[str, int],
+    channel_id: int,
+    channel_definitions: List[Dict[str, object]],
 ) -> Optional[np.ndarray]:
     binary = _build_binary_mask(channels, thresholds, channel_id)
     if binary is None:
         return None
-    mask = (binary * 255).astype(np.uint8)
-    return np.stack([mask, mask, mask], axis=-1)
+    color_map = channel_definition_map(channel_definitions)
+    channel_color = str(color_map.get(channel_id, {}).get("color", "#ffffff"))
+    red, green, blue = channel_color_rgb(channel_color)
+    mask = binary.astype(np.float32)
+    rgb = np.zeros((*mask.shape, 3), dtype=np.float32)
+    rgb[..., 0] = mask * red
+    rgb[..., 1] = mask * green
+    rgb[..., 2] = mask * blue
+    return (rgb * 255.0).astype(np.uint8)
 
 
-def _generate_mask_image(channels: Dict[int, np.ndarray], thresholds: Dict[str, int]) -> Optional[np.ndarray]:
-    masks = [
-        _build_binary_mask(channels, thresholds, channel_id)
-        for channel_id in (1, 2, 3)
-    ]
-    masks = [mask for mask in masks if mask is not None]
-    if not masks:
+def _generate_mask_image(
+    channels: Dict[int, np.ndarray],
+    thresholds: Dict[str, int],
+    channel_definitions: List[Dict[str, object]],
+) -> Optional[np.ndarray]:
+    masks = {channel_id: _build_binary_mask(channels, thresholds, channel_id) for channel_id in (1, 2, 3)}
+    valid_masks = [mask for mask in masks.values() if mask is not None]
+    if not valid_masks:
         sample = next(iter(channels.values()), None)
         if sample is None:
             return None
         shape = sample.shape
         return np.zeros((*shape, 3), dtype=np.uint8)
-    combined = np.maximum.reduce(masks)
-    mask = (combined * 255).astype(np.uint8)
-    return np.stack([mask, mask, mask], axis=-1)
+    color_map = channel_definition_map(channel_definitions)
+    rgb = np.zeros((*valid_masks[0].shape, 3), dtype=np.float32)
+    for channel_id in (1, 2, 3):
+        mask = masks.get(channel_id)
+        if mask is None:
+            continue
+        channel_color = str(color_map.get(channel_id, {}).get("color", "#ffffff"))
+        red, green, blue = channel_color_rgb(channel_color)
+        binary = mask.astype(np.float32)
+        rgb[..., 0] += binary * red
+        rgb[..., 1] += binary * green
+        rgb[..., 2] += binary * blue
+    return (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
 def _apply_highlight(raw: np.ndarray, mask: np.ndarray, strength: float = 0.45) -> np.ndarray:
@@ -1738,19 +2350,31 @@ def _apply_highlight(raw: np.ndarray, mask: np.ndarray, strength: float = 0.45) 
     return result.astype(np.uint8)
 
 
+def _apply_white_mask(raw: np.ndarray, binary_mask: np.ndarray) -> np.ndarray:
+    """Cheap overlay: masked pixels become white; others keep the raw color."""
+    if raw.ndim != 3 or raw.shape[-1] != 3:
+        raise ValueError("Expected RGB uint8 image for raw overlay")
+    if binary_mask.ndim != 2:
+        raise ValueError("Expected 2D mask")
+    overlay = raw.copy()
+    overlay[binary_mask.astype(bool)] = 255
+    return overlay
+
+
 def _generate_channel_overlay_image(
     channels: Dict[int, np.ndarray],
     thresholds: Dict[str, int],
     channel_id: int,
     channel_ranges: Dict[int, Tuple[float, float]],
+    channel_definitions: List[Dict[str, object]],
 ) -> Optional[np.ndarray]:
-    raw = _generate_channel_raw_image(channels, channel_id, channel_ranges)
+    raw = _generate_channel_raw_image(channels, channel_id, channel_ranges, channel_definitions)
     if raw is None:
         return None
-    mask = _generate_channel_mask_image(channels, thresholds, channel_id)
-    if mask is None:
+    binary = _build_binary_mask(channels, thresholds, channel_id)
+    if binary is None:
         return raw
-    return _apply_highlight(raw, mask)
+    return _apply_white_mask(raw, binary)
 
 
 def _generate_ratio_overlay_image(
@@ -1758,37 +2382,41 @@ def _generate_ratio_overlay_image(
     thresholds: Dict[str, int],
     channel_pair: Tuple[int, ...],
     channel_ranges: Dict[int, Tuple[float, float]],
+    channel_definitions: List[Dict[str, object]],
 ) -> Optional[np.ndarray]:
     if len(channel_pair) != 2:
         return None
     raw_images: List[np.ndarray] = []
     for channel_id in channel_pair:
-        raw_image = _generate_channel_raw_image(channels, channel_id, channel_ranges)
+        raw_image = _generate_channel_raw_image(channels, channel_id, channel_ranges, channel_definitions)
         if raw_image is None:
             return None
         raw_images.append(raw_image.astype(np.float32))
     stack = np.stack(raw_images, axis=0)
     base = np.max(stack, axis=0).astype(np.uint8)
-    overlay = base
-    for channel_id in channel_pair:
-        mask = _generate_channel_mask_image(channels, thresholds, channel_id)
-        if mask is not None:
-            overlay = _apply_highlight(overlay, mask)
-    return overlay
+    masks = [_build_binary_mask(channels, thresholds, channel_id) for channel_id in channel_pair]
+    masks = [mask for mask in masks if mask is not None]
+    if not masks:
+        return base
+    combined = np.maximum.reduce(masks)
+    return _apply_white_mask(base, combined)
 
 
 def _generate_overlay_image(
     channels: Dict[int, np.ndarray],
     thresholds: Dict[str, int],
     channel_ranges: Dict[int, Tuple[float, float]],
+    channel_definitions: List[Dict[str, object]],
 ) -> Optional[np.ndarray]:
-    raw = _generate_raw_image(channels, channel_ranges)
+    raw = _generate_raw_image(channels, channel_ranges, channel_definitions)
     if raw is None:
         return None
-    mask = _generate_mask_image(channels, thresholds)
-    if mask is None:
+    masks = [_build_binary_mask(channels, thresholds, channel_id) for channel_id in (1, 2, 3)]
+    masks = [mask for mask in masks if mask is not None]
+    if not masks:
         return raw
-    return _apply_highlight(raw, mask, strength=0.35)
+    combined = np.maximum.reduce(masks)
+    return _apply_white_mask(raw, combined)
 
 
 def _render_preview_variant(
@@ -1796,21 +2424,22 @@ def _render_preview_variant(
     thresholds: Dict[str, int],
     variant: PreviewVariant,
     channel_ranges: Dict[int, Tuple[float, float]],
+    channel_definitions: List[Dict[str, object]],
 ) -> Optional[np.ndarray]:
     if variant.variant == "raw":
         if len(variant.channels) == 1:
-            return _generate_channel_raw_image(channels, variant.channels[0], channel_ranges)
-        return _generate_raw_image(channels, channel_ranges)
+            return _generate_channel_raw_image(channels, variant.channels[0], channel_ranges, channel_definitions)
+        return _generate_raw_image(channels, channel_ranges, channel_definitions)
     if variant.variant == "mask":
         if len(variant.channels) == 1:
-            return _generate_channel_mask_image(channels, thresholds, variant.channels[0])
-        return _generate_mask_image(channels, thresholds)
+            return _generate_channel_mask_image(channels, thresholds, variant.channels[0], channel_definitions)
+        return _generate_mask_image(channels, thresholds, channel_definitions)
     if variant.variant == "overlay":
         if len(variant.channels) == 1:
-            return _generate_channel_overlay_image(channels, thresholds, variant.channels[0], channel_ranges)
+            return _generate_channel_overlay_image(channels, thresholds, variant.channels[0], channel_ranges, channel_definitions)
         if len(variant.channels) == 2:
-            return _generate_ratio_overlay_image(channels, thresholds, variant.channels, channel_ranges)
-        return _generate_overlay_image(channels, thresholds, channel_ranges)
+            return _generate_ratio_overlay_image(channels, thresholds, variant.channels, channel_ranges, channel_definitions)
+        return _generate_overlay_image(channels, thresholds, channel_ranges, channel_definitions)
     return None
 
 

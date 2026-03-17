@@ -16,6 +16,19 @@ from config import DEFAULT_THRESHOLDS, DEFAULT_MARKER, DEFAULT_MARKER_2D
 
 # Set up logging
 logger = logging.getLogger(__name__)
+SUPPORTED_MICROSCOPY_EXTENSIONS = (".nd2", ".czi", ".oib", ".oif")
+
+
+def _project_channel_stack(channel_data: np.ndarray, projection: str) -> np.ndarray:
+    if channel_data.ndim <= 2:
+        return channel_data
+    if projection == "max":
+        return np.max(channel_data, axis=0)
+    if projection == "sum":
+        return np.sum(channel_data, axis=0)
+    if projection == "none":
+        return channel_data
+    raise ValueError(f"Unsupported projection mode: {projection}")
 
 def detect_pixel_size(filepath: str) -> Optional[float]:
     """
@@ -27,23 +40,40 @@ def detect_pixel_size(filepath: str) -> Optional[float]:
     Returns:
         Detected pixel size in micrometers, or None if unavailable.
     """
-    try:
-        with ND2Reader(filepath) as nd2:
+    file_suffix = Path(filepath).suffix.lower()
+    if file_suffix == ".nd2":
+        try:
+            with ND2Reader(filepath) as nd2:
+                pixel_size = getattr(nd2.metadata, "pixel_microns", None)
+                value = _extract_pixel_value(pixel_size)
+                if value is not None and value > 0:
+                    return float(value)
+        except Exception as exc:
+            logger.debug(f"Could not read pixel size from {filepath}: {exc}")
+        try:
+            nd2 = Nd2(filepath)
             pixel_size = getattr(nd2.metadata, "pixel_microns", None)
+            nd2.close()
             value = _extract_pixel_value(pixel_size)
             if value is not None and value > 0:
                 return float(value)
-    except Exception as exc:
-        logger.debug(f"Could not read pixel size from {filepath}: {exc}")
+        except Exception as exc:
+            logger.debug(f"Fallback pixel size read failed for {filepath}: {exc}")
+        return None
+
     try:
-        nd2 = Nd2(filepath)
-        pixel_size = getattr(nd2.metadata, "pixel_microns", None)
-        nd2.close()
-        value = _extract_pixel_value(pixel_size)
+        from aicsimageio import AICSImage  # type: ignore
+
+        image = AICSImage(filepath)
+        pixel_sizes = getattr(image, "physical_pixel_sizes", None)
+        if pixel_sizes is None:
+            return None
+        x_size = getattr(pixel_sizes, "X", None)
+        value = _extract_pixel_value(x_size)
         if value is not None and value > 0:
             return float(value)
     except Exception as exc:
-        logger.debug(f"Fallback pixel size read failed for {filepath}: {exc}")
+        logger.debug(f"Could not read pixel size via AICSImage from {filepath}: {exc}")
     return None
 
 
@@ -62,13 +92,13 @@ def _extract_pixel_value(pixel_size: Optional[Union[Sequence[float], float]]) ->
 
 def get_nd2_files(directory: str) -> List[str]:
     """
-    Recursively find all ND2 files in a directory.
+    Recursively find supported microscopy files in a directory.
     
     Args:
         directory: Root directory to search
         
     Returns:
-        List of paths to ND2 files
+        List of paths to supported files
     """
     if not os.path.exists(directory):
         raise ValueError(f"Directory does not exist: {directory}")
@@ -76,10 +106,14 @@ def get_nd2_files(directory: str) -> List[str]:
         raise ValueError(f"Not a directory: {directory}")
 
     directory_path = Path(directory)
-    nd2_files = [str(p.absolute()) for p in directory_path.glob("**/*.nd2")]
-    
-    logger.info(f"Found {len(nd2_files)} ND2 files in {directory}")
-    return nd2_files
+    microscopy_files = [
+        str(p.absolute())
+        for p in directory_path.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED_MICROSCOPY_EXTENSIONS
+    ]
+
+    logger.info(f"Found {len(microscopy_files)} microscopy files in {directory}")
+    return sorted(microscopy_files)
 
 def parse_mouse_id(filename: str, marker: str = DEFAULT_MARKER, mouse_ids: list = None) -> str:
     """
@@ -117,61 +151,85 @@ def parse_mouse_id(filename: str, marker: str = DEFAULT_MARKER, mouse_ids: list 
     except (ValueError, IndexError):
         raise ValueError(f"Could not find marker '{marker}' in filename: {filename}")
 
-def load_nd2_file(filepath: str, is_3d: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_nd2_file(filepath: str, is_3d: bool = True, projection: str = "max") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load an ND2 file and extract channel data.
+    Load a microscopy file and extract channel data.
     
     Args:
-        filepath: Path to the ND2 file
+        filepath: Path to the microscopy file
         is_3d: Whether the file contains 3D data
+        projection: Z-axis projection for 3D stacks ("max", "sum", "none")
         
     Returns:
         Tuple of (channel_1, channel_2, channel_3) data
     """
     try:
-        if is_3d:
-            # Handle 3D data using ND2Reader
-            nd2 = ND2Reader(filepath)
-            nd2.bundle_axes = ('c', 'y', 'x')
-            nd2.iter_axes = 'z'
-            
-            image = np.asarray(nd2)
-            logger.debug(f"Loaded 3D image: {filepath}, shape: {image.shape}")
-            
-            channel_arrays: List[np.ndarray] = []
-            channel_count = image.shape[1] if image.ndim >= 2 else 0
-            for idx in range(min(channel_count, 3)):
-                channel_arrays.append(np.max(image[:, idx, :, :], axis=0))
-            
-            nd2.close()
-            
-        else:
-            # Handle 2D data using Nd2
-            nd2 = Nd2(filepath)
-            image = np.asarray(nd2)
-            nd2.close()
-            
-            logger.debug(f"Loaded 2D image: {filepath}, shape: {image.shape}")
-            
-            channel_arrays = []
-            if image.ndim >= 3:
-                channel_axis = 0
-                channel_count = image.shape[channel_axis]
+        file_suffix = Path(filepath).suffix.lower()
+        if file_suffix == ".nd2":
+            if is_3d:
+                nd2 = ND2Reader(filepath)
+                nd2.bundle_axes = ("c", "y", "x")
+                nd2.iter_axes = "z"
+
+                image = np.asarray(nd2)
+                logger.debug(f"Loaded 3D image: {filepath}, shape: {image.shape}")
+
+                channel_arrays: List[np.ndarray] = []
+                channel_count = image.shape[1] if image.ndim >= 2 else 0
                 for idx in range(min(channel_count, 3)):
-                    channel_arrays.append(image[idx])
+                    channel_stack = image[:, idx, :, :]
+                    channel_arrays.append(_project_channel_stack(channel_stack, projection))
+
+                nd2.close()
             else:
-                raise ValueError(f"Unexpected ND2 image shape for 2D data: {image.shape}")
+                nd2 = Nd2(filepath)
+                image = np.asarray(nd2)
+                nd2.close()
+
+                logger.debug(f"Loaded 2D image: {filepath}, shape: {image.shape}")
+
+                channel_arrays = []
+                if image.ndim >= 3:
+                    channel_axis = 0
+                    channel_count = image.shape[channel_axis]
+                    for idx in range(min(channel_count, 3)):
+                        channel_arrays.append(image[idx])
+                else:
+                    raise ValueError(f"Unexpected ND2 image shape for 2D data: {image.shape}")
+        else:
+            try:
+                from aicsimageio import AICSImage  # type: ignore
+            except Exception as exc:
+                raise ImportError(
+                    "Loading .czi/.oib files requires the optional 'aicsimageio' dependency."
+                ) from exc
+
+            image = AICSImage(filepath)
+            data = image.get_image_data("CZYX", T=0)
+            logger.debug(f"Loaded microscopy image via AICSImage: {filepath}, shape: {data.shape}")
+
+            channel_arrays = []
+            channel_count = data.shape[0] if data.ndim >= 1 else 0
+            for idx in range(min(channel_count, 3)):
+                channel_stack = np.asarray(data[idx])
+                if is_3d:
+                    channel_arrays.append(_project_channel_stack(channel_stack, projection))
+                else:
+                    if channel_stack.ndim == 3:
+                        channel_arrays.append(channel_stack[0])
+                    else:
+                        channel_arrays.append(channel_stack)
 
         actual_channels = len(channel_arrays)
         if actual_channels == 0:
-            raise ValueError(f"No channels found in ND2 file: {filepath}")
+            raise ValueError(f"No channels found in microscopy file: {filepath}")
 
         reference = channel_arrays[0]
         while len(channel_arrays) < 3:
             channel_arrays.append(np.zeros_like(reference))
         if actual_channels < 3:
             logger.warning(
-                f"Padded ND2 file {os.path.basename(filepath)} from {actual_channels} to 3 channels with zeros"
+                f"Padded microscopy file {os.path.basename(filepath)} from {actual_channels} to 3 channels with zeros"
             )
 
         channel_1, channel_2, channel_3 = channel_arrays[:3]

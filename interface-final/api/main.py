@@ -17,6 +17,8 @@ from fastapi.responses import FileResponse
 from .schemas import (
     AnalyzeRequest,
     AnalyzeResponse,
+    ConfigAutoGroupRequest,
+    ConfigAutoGroupResponse,
     ConfigCreateRequest,
     ConfigCreateResponse,
     ConfigReadResponse,
@@ -32,6 +34,8 @@ from .schemas import (
     PreviewDownloadResponse,
     PixelSizeUpdateRequest,
     PixelSizeUpdateResponse,
+    ChannelUpdateRequest,
+    ChannelUpdateResponse,
     RatioUpdateRequest,
     RatioUpdateResponse,
     RunStatus,
@@ -41,6 +45,7 @@ from .schemas import (
     UploadResponse,
 )
 from .services.configurator import create_config, read_config, scan_input_directory
+from .services.configurator import suggest_groups_with_llm
 from .services.studies import (
     analyze_study,
     generate_downloads,
@@ -51,9 +56,12 @@ from .services.studies import (
     resolve_download_path,
     resolve_preview_path,
     list_ratio_definitions,
+    list_channel_definitions,
     update_ratio_definitions,
+    update_channel_definitions,
     update_pixel_size,
     render_preview_panel,
+    study_has_preview_sources,
 )
 from .services.uploads import UploadCategory, store_upload
 from .services.threshold_runner import describe_run, launch_threshold_run
@@ -61,7 +69,7 @@ from .state import STATE
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="ND2 Interface-Final Station", version="0.1.0")
+    app = FastAPI(title="Microscopy Interface-Final Station", version="0.1.0")
 
     app.add_middleware(
         CORSMiddleware,
@@ -82,6 +90,10 @@ def create_app() -> FastAPI:
     @app.post("/config/create", response_model=ConfigCreateResponse)
     async def config_create(request: ConfigCreateRequest) -> ConfigCreateResponse:
         return create_config(request)
+
+    @app.post("/config/auto-groups", response_model=ConfigAutoGroupResponse)
+    async def config_auto_groups(request: ConfigAutoGroupRequest) -> ConfigAutoGroupResponse:
+        return suggest_groups_with_llm(request)
 
     @app.get("/config/read", response_model=ConfigReadResponse)
     async def config_read(path: str) -> ConfigReadResponse:
@@ -106,8 +118,9 @@ def create_app() -> FastAPI:
             "mice_count": len({img.mouse_id for img in record.results.image_data}),
             "image_count": len(record.results.image_data),
             "nd2_root": str(record.input_dir),
-            "nd2_available": record.input_dir.exists(),
+            "nd2_available": study_has_preview_sources(record.study_id),
             "ratio_definitions": record.ratio_definitions,
+            "channel_definitions": record.channel_definitions,
             "pixel_size_um": record.pixel_size_um,
         }
 
@@ -156,6 +169,16 @@ def create_app() -> FastAPI:
     async def update_ratio_defs(study_id: str, request: RatioUpdateRequest) -> RatioUpdateResponse:
         ratios = update_ratio_definitions(study_id, [entry.dict() for entry in request.ratios])
         return RatioUpdateResponse(ratios=ratios)
+
+    @app.get("/studies/{study_id}/channels", response_model=ChannelUpdateResponse)
+    async def list_channel_defs(study_id: str) -> ChannelUpdateResponse:
+        channels = list_channel_definitions(study_id)
+        return ChannelUpdateResponse(channels=channels)
+
+    @app.post("/studies/{study_id}/channels", response_model=ChannelUpdateResponse)
+    async def update_channel_defs(study_id: str, request: ChannelUpdateRequest) -> ChannelUpdateResponse:
+        channels = update_channel_definitions(study_id, [entry.dict() for entry in request.channels])
+        return ChannelUpdateResponse(channels=channels)
 
     @app.post("/studies/{study_id}/pixel-size", response_model=PixelSizeUpdateResponse)
     async def update_pixel_size_endpoint(study_id: str, request: PixelSizeUpdateRequest) -> PixelSizeUpdateResponse:

@@ -40,7 +40,14 @@ export default function App() {
           </IconButton>
         </Tooltip>
       </Box>
-      <Box sx={{ flex: 2, minWidth: 0, overflowY: "auto", p: 3 }}>
+      <Box
+        sx={{
+          flex: 2,
+          minWidth: 0,
+          overflowY: "auto",
+          p: 3
+        }}
+      >
         <AnalysisBoard />
       </Box>
       <Divider orientation="vertical" flexItem sx={{ borderColor: "rgba(15,23,42,0.08)" }} />

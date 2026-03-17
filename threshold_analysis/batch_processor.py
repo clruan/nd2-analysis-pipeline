@@ -1,11 +1,11 @@
-"""Batch processing for threshold analysis - handles multiple ND2 files."""
+"""Batch processing for threshold analysis - handles microscopy files."""
 
 import os
 import logging
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from joblib import Parallel, delayed
 import pandas as pd
 import numpy as np
@@ -27,10 +27,11 @@ def process_directory_all_thresholds(
     n_jobs: int = 1,  # Start with 1 for stability
     max_threshold: int = 4095,
     save_intermediate: bool = True,
-    progress_interval: int = 1  # Show progress every N files
+    progress_interval: int = 1,  # Show progress every N files
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> ThresholdResults:
     """
-    Process all ND2 files in a directory with threshold analysis.
+    Process all supported microscopy files in a directory with threshold analysis.
     
     Mimics the original pipeline's batch processing approach but generates
     threshold data for all values 0-4095.
@@ -60,14 +61,16 @@ def process_directory_all_thresholds(
     config = GroupConfig.from_json(config_path)
     mouse_lookup = config.build_mouse_info()
     
-    # Find all ND2 files (reuse existing function)
-    print("🔍 Searching for ND2 files...")
+    # Find all source image files (reuse existing function)
+    print("🔍 Searching for microscopy files...")
     nd2_files = get_nd2_files(input_dir)
     if not nd2_files:
-        raise ValueError(f"No ND2 files found in {input_dir}")
-    
-    print(f"📊 Found {len(nd2_files)} ND2 files")
-    logger.info(f"Found {len(nd2_files)} ND2 files")
+        raise ValueError(f"No supported microscopy files found in {input_dir}")
+
+    print(f"📊 Found {len(nd2_files)} microscopy files")
+    logger.info(f"Found {len(nd2_files)} microscopy files")
+    if progress_callback:
+        progress_callback(0, len(nd2_files), "Discovered microscopy files")
     
     # Test accessibility of first few files
     print("🔍 Testing file accessibility...")
@@ -83,7 +86,7 @@ def process_directory_all_thresholds(
             print(f"   ❌ {Path(filepath).name} - Error: {str(e)}")
     
     if accessible_count == 0:
-        raise ValueError("No ND2 files are accessible. Check network connection and file permissions.")
+        raise ValueError("No microscopy files are accessible. Check network connection and file permissions.")
     
     print(f"✅ {accessible_count}/5 test files accessible")
     
@@ -133,6 +136,9 @@ def process_directory_all_thresholds(
                 failed_files.append(filename)
                 print(f"   ❌ Error: {filename} - {str(e)} - {file_elapsed:.1f}s")
                 logger.error(f"❌ Error processing {filename}: {str(e)} - {file_elapsed:.1f}s")
+
+            if progress_callback:
+                progress_callback(i + 1, len(nd2_files), filename)
             
             # Show estimated time remaining
             if i > 0:
@@ -157,6 +163,8 @@ def process_directory_all_thresholds(
         )
         # Filter out None results
         results = [r for r in results if r is not None]
+        if progress_callback:
+            progress_callback(len(nd2_files), len(nd2_files), "Completed parallel threshold generation")
     
     if not results:
         raise ValueError("No files were processed successfully")
@@ -170,7 +178,10 @@ def process_directory_all_thresholds(
     threshold_results = ThresholdResults(
         study_name=study_name,
         image_data=results,
-        group_info=config.groups
+        group_info=config.groups,
+        ratio_definitions=config.ratios,
+        channel_definitions=config.channel_definitions,
+        pixel_size_um=config.pixel_size_um,
     )
     
     # Save results if output file specified
@@ -222,6 +233,9 @@ def save_threshold_results(results: ThresholdResults, filepath: str) -> None:
         data = {
             'study_name': results.study_name,
             'group_info': results.group_info,
+            'ratio_definitions': results.ratio_definitions,
+            'channel_definitions': results.channel_definitions,
+            'pixel_size_um': results.pixel_size_um,
             'image_data': []
         }
         
@@ -267,7 +281,10 @@ def load_threshold_results(filepath: str) -> ThresholdResults:
         return ThresholdResults(
             study_name=data['study_name'],
             image_data=image_data,
-            group_info=data['group_info']
+            group_info=data['group_info'],
+            ratio_definitions=data.get('ratio_definitions'),
+            channel_definitions=data.get('channel_definitions'),
+            pixel_size_um=data.get('pixel_size_um'),
         )
         
     except Exception as e:

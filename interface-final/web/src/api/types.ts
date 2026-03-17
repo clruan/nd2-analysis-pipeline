@@ -11,10 +11,23 @@ export interface ConfigScanResponse {
   }>;
 }
 
+export interface ChannelDefinition {
+  channel: number;
+  label: string;
+  color: string;
+}
+
 export interface ConfigCreateResponse {
   config_path: string;
   study_name: string;
   groups: Record<string, string[]>;
+  channel_definitions?: ChannelDefinition[] | null;
+}
+
+export interface ConfigAutoGroupResponse {
+  groups: Record<string, string[]>;
+  model: string;
+  notes?: string | null;
 }
 
 export interface ConfigReadResponse {
@@ -24,6 +37,7 @@ export interface ConfigReadResponse {
   pixel_size_um?: number | null;
   thresholds?: Record<string, Record<string, number>> | null;
   ratios?: RatioDefinition[] | null;
+  channel_definitions?: ChannelDefinition[] | null;
 }
 
 export interface RunStatus {
@@ -38,6 +52,8 @@ export interface RunStatus {
   completed_at?: string | null;
   latest_source_mtime?: string | null;
   source_hash?: string | null;
+  progress_completed: number;
+  progress_total?: number | null;
 }
 
 export interface LoadedStudy {
@@ -50,6 +66,7 @@ export interface LoadedStudy {
   nd2_root: string;
   nd2_available: boolean;
   ratio_definitions: RatioDefinition[];
+  channel_definitions: ChannelDefinition[];
   pixel_size_um?: number | null;
 }
 
@@ -103,6 +120,7 @@ export interface PreviewImage {
   subject_id: string;
   filename: string;
   image_path: string;
+  cache_token: string;
 }
 
 export interface PreviewResponse {
@@ -142,4 +160,8 @@ export interface UploadResponse {
 
 export interface RatioUpdateResponse {
   ratios: RatioDefinition[];
+}
+
+export interface ChannelUpdateResponse {
+  channels: ChannelDefinition[];
 }

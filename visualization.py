@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import os
 from pathlib import Path
 import logging
+import re
 from matplotlib.colors import LinearSegmentedColormap
 
 from image_processing import load_nd2_file, parse_mouse_id
@@ -17,27 +18,61 @@ from config import VISUALIZATION_RANGES, CHANNEL_COLORS, DEFAULT_MARKER, DEFAULT
 
 logger = logging.getLogger(__name__)
 
-# Custom colormaps
-colors_r = ["black", "red"]
-colors_g = ["black", "green"] 
-colors_b = ["black", "blue"]
-
-# Create custom colormaps
-red_cmap = LinearSegmentedColormap.from_list("custom_red", colors_r)
-green_cmap = LinearSegmentedColormap.from_list("custom_green", colors_g)
-blue_cmap = LinearSegmentedColormap.from_list("custom_blue", colors_b)
-
-# Channel colormap mapping
-CHANNEL_COLORMAPS = {
-    'channel_1': green_cmap,  # Green channel
-    'channel_2': red_cmap,    # Red channel
-    'channel_3': blue_cmap    # Blue channel
+DEFAULT_CHANNEL_DISPLAY = {
+    "channel_1": {"label": "Channel 1", "color": "#00ff00"},
+    "channel_2": {"label": "Channel 2", "color": "#ff0000"},
+    "channel_3": {"label": "Channel 3", "color": "#0000ff"},
 }
+
+NAMED_COLORS = {
+    "red": "#ff0000",
+    "green": "#00ff00",
+    "blue": "#0000ff",
+    "cyan": "#00ffff",
+    "magenta": "#ff00ff",
+    "yellow": "#ffff00",
+    "orange": "#ff8800",
+    "white": "#ffffff",
+    "gray": "#9ca3af",
+    "grey": "#9ca3af",
+}
+
+HEX_PATTERN = re.compile(r"^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+
+def _normalize_color(color: str, fallback: str) -> str:
+    if not isinstance(color, str):
+        return fallback
+    candidate = color.strip().lower()
+    if candidate in NAMED_COLORS:
+        return NAMED_COLORS[candidate]
+    match = HEX_PATTERN.match(candidate)
+    if not match:
+        return fallback
+    hex_value = match.group(1).lower()
+    if len(hex_value) == 3:
+        hex_value = "".join(ch * 2 for ch in hex_value)
+    return f"#{hex_value}"
+
+
+def _color_rgb(color: str) -> Tuple[float, float, float]:
+    normalized = _normalize_color(color, "#ffffff")
+    return (
+        int(normalized[1:3], 16) / 255.0,
+        int(normalized[3:5], 16) / 255.0,
+        int(normalized[5:7], 16) / 255.0,
+    )
 
 class ND2Visualizer:
     """Advanced visualization tools for ND2 images."""
     
-    def __init__(self, config: VisualizationConfig = None, viz_ranges: Dict = None, pixel_size_um: float = None):
+    def __init__(
+        self,
+        config: VisualizationConfig = None,
+        viz_ranges: Dict = None,
+        pixel_size_um: float = None,
+        channel_definitions: Optional[List[Dict[str, object]]] = None,
+    ):
         """
         Initialize visualizer with configuration.
         
@@ -57,9 +92,30 @@ class ND2Visualizer:
             
         # Use custom pixel size if provided, otherwise use default
         self.pixel_size_um = pixel_size_um or 0.222
+
+        self.channel_display = self._build_channel_display(channel_definitions)
         
         # Set up matplotlib for better rendering
         plt.style.use('default')
+
+    def _build_channel_display(self, channel_definitions: Optional[List[Dict[str, object]]]) -> Dict[str, Dict[str, object]]:
+        display = {key: dict(value) for key, value in DEFAULT_CHANNEL_DISPLAY.items()}
+        for entry in channel_definitions or []:
+            try:
+                channel = int(entry.get("channel"))
+            except Exception:
+                continue
+            key = f"channel_{channel}"
+            if key not in display:
+                continue
+            label = str(entry.get("label") or display[key]["label"]).strip() or str(display[key]["label"])
+            color = _normalize_color(str(entry.get("color") or display[key]["color"]), str(display[key]["color"]))
+            display[key] = {"label": label, "color": color}
+
+        for key, value in display.items():
+            color = str(value["color"])
+            value["cmap"] = LinearSegmentedColormap.from_list(f"{key}_cmap", ["black", color])
+        return display
         
     def add_scale_bar(self, ax, image_shape: Tuple[int, int], 
                      scale_bar_um: float = None, 
@@ -170,14 +226,14 @@ class ND2Visualizer:
         if panel_id == 'composite':
             if 'composite' not in composite_cache:
                 composite_cache['composite'] = self._create_rgb_composite(
-                    channels['channel_1'], channels['channel_2'], channels['channel_3']
+                    channels['channel_1'], channels['channel_2'], channels['channel_3'], resolved_ranges
                 )
             ax.imshow(composite_cache['composite'])
             if add_scale_bar:
                 self.add_scale_bar(ax, composite_cache['composite'].shape[:2])
             return
         channel_data = channels.get(panel_id)
-        cmap = CHANNEL_COLORMAPS.get(panel_id, 'gray')
+        cmap = self.channel_display.get(panel_id, {}).get("cmap", "gray")
         if channel_data is None:
             ax.imshow(np.zeros((1, 1)))
             return
@@ -240,9 +296,13 @@ class ND2Visualizer:
         
         return fig
 
-    def _create_rgb_composite(self, channel_1: np.ndarray, 
-                             channel_2: np.ndarray, 
-                             channel_3: np.ndarray) -> np.ndarray:
+    def _create_rgb_composite(
+        self,
+        channel_1: np.ndarray,
+        channel_2: np.ndarray,
+        channel_3: np.ndarray,
+        resolved_ranges: Dict[str, Dict[str, float]],
+    ) -> np.ndarray:
         """
         Create RGB composite image from three channels.
         
@@ -257,17 +317,26 @@ class ND2Visualizer:
         rgb = np.zeros((channel_1.shape[0], channel_1.shape[1], 3), dtype=np.float32)
         
         # Normalize each channel to [0, 1]
-        rgb[:,:,0] = self._normalize_channel(channel_2, self.viz_ranges['channel_2'])  # Red
-        rgb[:,:,1] = self._normalize_channel(channel_1, self.viz_ranges['channel_1'])  # Green
-        rgb[:,:,2] = self._normalize_channel(channel_3, self.viz_ranges['channel_3'])  # Blue
-        
+        channels = {
+            "channel_1": channel_1,
+            "channel_2": channel_2,
+            "channel_3": channel_3,
+        }
+        for key, channel in channels.items():
+            normalized = self._normalize_channel(channel, resolved_ranges[key])
+            red, green, blue = _color_rgb(str(self.channel_display[key]["color"]))
+            rgb[:, :, 0] += normalized * red
+            rgb[:, :, 1] += normalized * green
+            rgb[:, :, 2] += normalized * blue
+
         return np.clip(rgb, 0, 1)
 
     def _normalize_channel(self, channel: np.ndarray, range_dict: Dict) -> np.ndarray:
         """Normalize channel data to [0, 1] range."""
-        vmin, vmax = range_dict['vmin'], range_dict['vmax']
-        normalized = (channel - vmin) / (vmax - vmin)
-        return np.clip(normalized, 0, 1)
+        vmin, vmax = float(range_dict['vmin']), float(range_dict['vmax'])
+        denom = max(vmax - vmin, 1e-6)
+        normalized = (channel.astype(np.float32) - vmin) / denom
+        return np.clip(normalized, 0.0, 1.0)
 
     def visualize_single_file(
         self,
