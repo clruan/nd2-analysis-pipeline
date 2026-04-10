@@ -240,6 +240,35 @@ export default function PreviewPane() {
         })
       }));
   }, [previewData]);
+  const groupedPreviewMap = useMemo(() => {
+    const map = new Map<string, PreviewGroup>();
+    groupedPreviews.forEach((group) => {
+      map.set(group.group, group);
+    });
+    return map;
+  }, [groupedPreviews]);
+  const displayGroups = useMemo(() => {
+    const ordered: string[] = [];
+    const seen = new Set<string>();
+
+    (study?.groups ?? []).forEach((group) => {
+      if (seen.has(group)) {
+        return;
+      }
+      seen.add(group);
+      ordered.push(group);
+    });
+
+    groupedPreviews.forEach((group) => {
+      if (seen.has(group.group)) {
+        return;
+      }
+      seen.add(group.group);
+      ordered.push(group.group);
+    });
+
+    return ordered;
+  }, [groupedPreviews, study]);
 
   useEffect(() => {
     setSelectedPreviewByGroup((previous) => {
@@ -270,13 +299,17 @@ export default function PreviewPane() {
   }, [groupedPreviews]);
 
   const activeColumns = useMemo<PreviewColumn[]>(() => {
-    return groupedPreviews
-      .map((groupColumn) => {
-        const selected = selectedPreviewByGroup[groupColumn.group];
+    return displayGroups
+      .map((group) => {
+        const groupColumn = groupedPreviewMap.get(group);
+        if (!groupColumn || groupColumn.subjects.length === 0) {
+          return null;
+        }
+        const selected = selectedPreviewByGroup[group];
         return groupColumn.subjects.find((subject) => subject.key === selected) ?? groupColumn.subjects[0] ?? null;
       })
       .filter((value): value is PreviewColumn => Boolean(value));
-  }, [groupedPreviews, selectedPreviewByGroup]);
+  }, [displayGroups, groupedPreviewMap, selectedPreviewByGroup]);
 
   useEffect(() => {
     const nextSubjects = activeColumns.map((column) => ({
@@ -307,6 +340,10 @@ export default function PreviewPane() {
     });
     return map;
   }, [activeColumns]);
+  const missingPreviewGroups = useMemo(
+    () => displayGroups.filter((group) => (groupedPreviewMap.get(group)?.subjects.length ?? 0) === 0),
+    [displayGroups, groupedPreviewMap]
+  );
 
   const activeGroups = useMemo(() => {
     if (!study) return null;
@@ -514,6 +551,11 @@ export default function PreviewPane() {
               Loading remaining subjects in background…
             </Typography>
           )}
+          {missingPreviewGroups.length > 0 && (
+            <Typography variant="caption" color="text.secondary" display="block">
+              No preview tiles available for: {missingPreviewGroups.join(", ")}
+            </Typography>
+          )}
         </Box>
         <Box
           sx={{
@@ -638,69 +680,79 @@ export default function PreviewPane() {
       <Box
         sx={{
           display: "grid",
-          gridTemplateColumns: `max-content repeat(${groupedPreviews.length}, minmax(${imageWidth}px, 1fr))`,
+          gridTemplateColumns: `max-content repeat(${displayGroups.length}, minmax(${imageWidth}px, 1fr))`,
           columnGap: 1,
           alignItems: "center"
         }}
       >
         <Box />
-        {groupedPreviews.map((groupColumn) => {
-          const activeColumn = activeColumnsByGroup.get(groupColumn.group) ?? groupColumn.subjects[0];
-          if (!activeColumn) {
-            return null;
-          }
+        {displayGroups.map((group) => {
+          const groupColumn = groupedPreviewMap.get(group);
+          const activeColumn = activeColumnsByGroup.get(group) ?? groupColumn?.subjects[0] ?? null;
           return (
-            <Stack key={`header-${groupColumn.group}`} spacing={0.4}>
-              <Tooltip
-                title={
-                  <Stack spacing={0.25}>
-                    <Typography variant="caption">Subject: {activeColumn.subjectId}</Typography>
-                    <Typography variant="caption">File: {activeColumn.filename}</Typography>
+            <Stack key={`header-${group}`} spacing={0.4}>
+              {activeColumn ? (
+                <Tooltip
+                  title={
+                    <Stack spacing={0.25}>
+                      <Typography variant="caption">Subject: {activeColumn.subjectId}</Typography>
+                      <Typography variant="caption">File: {activeColumn.filename}</Typography>
+                    </Stack>
+                  }
+                  placement="top"
+                >
+                  <Stack direction="row" spacing={0.25} alignItems="center">
+                    <Typography variant="subtitle2" noWrap>
+                      {group}
+                    </Typography>
+                    <Tooltip title="Download adjusted panel">
+                      <IconButton
+                        size="small"
+                        onClick={() => handlePanelDownload(activeColumn)}
+                        disabled={previewDownload.isPending && activePanelDownload === activeColumn.key}
+                      >
+                        {previewDownload.isPending && activePanelDownload === activeColumn.key ? (
+                          <CircularProgress size={12} thickness={6} />
+                        ) : (
+                          <DownloadIcon fontSize="inherit" />
+                        )}
+                      </IconButton>
+                    </Tooltip>
                   </Stack>
-                }
-                placement="top"
-              >
-                <Stack direction="row" spacing={0.25} alignItems="center">
-                  <Typography variant="subtitle2" noWrap>
-                    {groupColumn.group}
-                  </Typography>
-                  <Tooltip title="Download adjusted panel">
-                    <IconButton
-                      size="small"
-                      onClick={() => handlePanelDownload(activeColumn)}
-                      disabled={previewDownload.isPending && activePanelDownload === activeColumn.key}
-                    >
-                      {previewDownload.isPending && activePanelDownload === activeColumn.key ? (
-                        <CircularProgress size={12} thickness={6} />
-                      ) : (
-                        <DownloadIcon fontSize="inherit" />
-                      )}
-                    </IconButton>
-                  </Tooltip>
+                </Tooltip>
+              ) : (
+                <Typography variant="subtitle2" noWrap>
+                  {group}
+                </Typography>
+              )}
+              {groupColumn && activeColumn ? (
+                <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap sx={{ maxWidth: imageWidth }}>
+                  {groupColumn.subjects.map((subject, index) => {
+                    const selected = subject.key === activeColumn.key;
+                    return (
+                      <Chip
+                        key={subject.key}
+                        size="small"
+                        clickable
+                        label={`${subject.subjectId}-${index + 1}`}
+                        color={selected ? "primary" : "default"}
+                        variant={selected ? "filled" : "outlined"}
+                        onClick={() =>
+                          setSelectedPreviewByGroup((previous) => ({
+                            ...previous,
+                            [group]: subject.key
+                          }))
+                        }
+                        sx={{ height: 20, "& .MuiChip-label": { px: 0.75, fontSize: 11 } }}
+                      />
+                    );
+                  })}
                 </Stack>
-              </Tooltip>
-              <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap sx={{ maxWidth: imageWidth }}>
-                {groupColumn.subjects.map((subject, index) => {
-                  const selected = subject.key === activeColumn.key;
-                  return (
-                    <Chip
-                      key={subject.key}
-                      size="small"
-                      clickable
-                      label={`${subject.subjectId}-${index + 1}`}
-                      color={selected ? "primary" : "default"}
-                      variant={selected ? "filled" : "outlined"}
-                      onClick={() =>
-                        setSelectedPreviewByGroup((previous) => ({
-                          ...previous,
-                          [groupColumn.group]: subject.key
-                        }))
-                      }
-                      sx={{ height: 20, "& .MuiChip-label": { px: 0.75, fontSize: 11 } }}
-                    />
-                  );
-                })}
-              </Stack>
+              ) : (
+                <Typography variant="caption" color="text.secondary">
+                  No preview
+                </Typography>
+              )}
             </Stack>
           );
         })}
@@ -717,7 +769,7 @@ export default function PreviewPane() {
             <Box
               sx={{
                 display: "grid",
-                gridTemplateColumns: `max-content repeat(${activeColumns.length}, minmax(${imageWidth}px, 1fr))`,
+                gridTemplateColumns: `max-content repeat(${displayGroups.length}, minmax(${imageWidth}px, 1fr))`,
                 columnGap: 1,
                 rowGap: 0.75,
                 alignItems: "start"
@@ -741,7 +793,26 @@ export default function PreviewPane() {
                       {variantLabels[variant]}
                     </Typography>
                   </Box>
-                  {activeColumns.map((column) => {
+                  {displayGroups.map((group) => {
+                    const column = activeColumnsByGroup.get(group);
+                    if (!column) {
+                      return (
+                        <Box
+                          key={`${group}-${metric.id}-${variant}`}
+                          sx={{
+                            minHeight: imageHeight,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            border: "1px dashed rgba(148,163,184,0.45)",
+                            borderRadius: 0.5,
+                            color: "text.secondary"
+                          }}
+                        >
+                          <Typography variant="caption">No preview</Typography>
+                        </Box>
+                      );
+                    }
                     const metricBucket = column.metrics.get(metric.id);
                     const images = metricBucket?.get(variant) ?? [];
                     const isReference = referenceGroup ? column.group === referenceGroup : false;

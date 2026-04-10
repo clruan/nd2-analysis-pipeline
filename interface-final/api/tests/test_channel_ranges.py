@@ -17,6 +17,7 @@ from api.services.studies import (  # noqa: E402
     _normalize_channel_ranges,
     _preview_dependency_token,
 )
+from api.services.preview_rendering import _generate_channel_mask_image, _generate_mask_image  # noqa: E402
 
 
 def test_normalize_channel_ranges_accepts_pydantic_models() -> None:
@@ -55,6 +56,48 @@ def test_channel_raw_image_uses_configured_color() -> None:
     assert int(image[0, 1, 0]) > 0
     assert int(image[0, 1, 1]) == 0
     assert int(image[0, 1, 2]) == 0
+
+
+def test_channel_mask_image_is_binary_black_and_white() -> None:
+    channels = {
+        1: np.array([[0, 1200]], dtype=np.uint16),
+        2: np.array([[0, 0]], dtype=np.uint16),
+        3: np.array([[0, 0]], dtype=np.uint16),
+    }
+    thresholds = {"channel_1": 1000, "channel_2": 1000, "channel_3": 1000}
+    definitions = [
+        {"channel": 1, "label": "DAPI", "color": "#ff0000"},
+        {"channel": 2, "label": "Marker A", "color": "#00ff00"},
+        {"channel": 3, "label": "Marker B", "color": "#0000ff"},
+    ]
+
+    image = _generate_channel_mask_image(channels, thresholds, 1, definitions)
+
+    assert image is not None
+    assert image.shape == (1, 2, 3)
+    assert tuple(image[0, 0]) == (0, 0, 0)
+    assert tuple(image[0, 1]) == (255, 255, 255)
+
+
+def test_combined_mask_image_is_binary_black_and_white() -> None:
+    channels = {
+        1: np.array([[0, 1200]], dtype=np.uint16),
+        2: np.array([[1500, 0]], dtype=np.uint16),
+        3: np.array([[0, 0]], dtype=np.uint16),
+    }
+    thresholds = {"channel_1": 1000, "channel_2": 1000, "channel_3": 1000}
+    definitions = [
+        {"channel": 1, "label": "DAPI", "color": "#ff0000"},
+        {"channel": 2, "label": "Marker A", "color": "#00ff00"},
+        {"channel": 3, "label": "Marker B", "color": "#0000ff"},
+    ]
+
+    image = _generate_mask_image(channels, thresholds, definitions)
+
+    assert image is not None
+    assert image.shape == (1, 2, 3)
+    assert tuple(image[0, 0]) == (255, 255, 255)
+    assert tuple(image[0, 1]) == (255, 255, 255)
 
 
 def test_preview_dependency_token_ignores_unrelated_threshold_changes() -> None:

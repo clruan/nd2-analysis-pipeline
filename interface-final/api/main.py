@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Dict
@@ -10,13 +11,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
+from .logging_utils import configure_logging, log_event
 from .schemas import (
     AnalyzeRequest,
     AnalyzeResponse,
+    ChannelUpdateRequest,
+    ChannelUpdateResponse,
     ConfigAutoGroupRequest,
     ConfigAutoGroupResponse,
     ConfigCreateRequest,
@@ -26,16 +30,14 @@ from .schemas import (
     ConfigScanResponse,
     DownloadResponse,
     LoadStudyRequest,
-    PreviewRequest,
-    PreviewResponse,
+    PixelSizeUpdateRequest,
+    PixelSizeUpdateResponse,
     PreviewClearRequest,
     PreviewClearResponse,
     PreviewDownloadRequest,
     PreviewDownloadResponse,
-    PixelSizeUpdateRequest,
-    PixelSizeUpdateResponse,
-    ChannelUpdateRequest,
-    ChannelUpdateResponse,
+    PreviewRequest,
+    PreviewResponse,
     RatioUpdateRequest,
     RatioUpdateResponse,
     RunStatus,
@@ -44,31 +46,43 @@ from .schemas import (
     ThresholdRunRequest,
     UploadResponse,
 )
-from .services.configurator import create_config, read_config, scan_input_directory
-from .services.configurator import suggest_groups_with_llm
+from .services.configurator import create_config, read_config, scan_input_directory, suggest_groups_with_llm
 from .services.studies import (
     analyze_study,
+    clear_preview_cache,
     generate_downloads,
     generate_previews,
-    clear_preview_cache,
+    list_channel_definitions,
+    list_ratio_definitions,
     load_study,
     perform_statistics,
+    render_preview_panel,
     resolve_download_path,
     resolve_preview_path,
-    list_ratio_definitions,
-    list_channel_definitions,
-    update_ratio_definitions,
+    study_has_preview_sources,
     update_channel_definitions,
     update_pixel_size,
-    render_preview_panel,
-    study_has_preview_sources,
+    update_ratio_definitions,
 )
-from .services.uploads import UploadCategory, store_upload
 from .services.threshold_runner import describe_run, launch_threshold_run
+from .services.uploads import UploadCategory, store_upload
 from .state import STATE
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def create_app() -> FastAPI:
+    configure_logging()
+    STATE.initialize()
+    log_event(
+        LOGGER,
+        "api_initialized",
+        project_id=STATE.settings.project_id,
+        session_id=STATE.settings.session_id,
+        state_db=str(STATE.settings.state_db),
+    )
+
     app = FastAPI(title="Microscopy Interface-Final Station", version="0.1.0")
 
     app.add_middleware(
@@ -82,6 +96,29 @@ def create_app() -> FastAPI:
     @app.get("/status")
     async def status() -> Dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/healthz")
+    async def healthz() -> Dict[str, object]:
+        report = STATE.health_report()
+        status_code = 200 if report["status"] == "ok" else 503
+        return JSONResponse(status_code=status_code, content=report)
+
+    @app.get("/readyz")
+    async def readyz() -> Dict[str, object]:
+        report = STATE.readiness_report()
+        if not report["ready"]:
+            log_event(
+                LOGGER,
+                "readiness_failed",
+                project_id=STATE.settings.project_id,
+                session_id=STATE.settings.session_id,
+                state_db=str(STATE.settings.state_db),
+                schema_initialized=report["schema_initialized"],
+                queue_writable=report["queue_writable"],
+                worker_alive=report["worker_alive"],
+            )
+        status_code = 200 if report["ready"] else 503
+        return JSONResponse(status_code=status_code, content=report)
 
     @app.post("/config/scan", response_model=ConfigScanResponse)
     async def config_scan(request: ConfigScanRequest) -> ConfigScanResponse:
@@ -100,8 +137,8 @@ def create_app() -> FastAPI:
         return read_config(path)
 
     @app.post("/runs/threshold", response_model=RunStatus)
-    async def run_threshold(request: ThresholdRunRequest, background: BackgroundTasks) -> RunStatus:
-        return launch_threshold_run(request, background)
+    async def run_threshold(request: ThresholdRunRequest) -> RunStatus:
+        return launch_threshold_run(request)
 
     @app.get("/runs/{job_id}", response_model=RunStatus)
     async def get_run(job_id: str) -> RunStatus:
@@ -117,7 +154,7 @@ def create_app() -> FastAPI:
             "groups": list(record.results.group_info.keys()),
             "mice_count": len({img.mouse_id for img in record.results.image_data}),
             "image_count": len(record.results.image_data),
-            "nd2_root": str(record.input_dir),
+            "nd2_root": str(record.input_dir) if record.input_dir else "",
             "nd2_available": study_has_preview_sources(record.study_id),
             "ratio_definitions": record.ratio_definitions,
             "channel_definitions": record.channel_definitions,
@@ -128,12 +165,12 @@ def create_app() -> FastAPI:
     async def list_loaded_studies() -> Dict[str, Dict[str, object]]:
         return {
             study_id: {
-                "study_name": record.results.study_name,
+                "study_name": record.study_name,
                 "source_path": str(record.source_path),
-                "loaded_at": record.loaded_at.isoformat() + "Z",
-                "groups": list(record.results.group_info.keys()),
+                "loaded_at": record.loaded_at.isoformat(),
+                "groups": list(record.groups),
             }
-            for study_id, record in STATE.iter_studies().items()
+            for study_id, record in STATE.list_studies().items()
         }
 
     @app.post("/studies/{study_id}/analyze", response_model=AnalyzeResponse)
@@ -167,7 +204,7 @@ def create_app() -> FastAPI:
 
     @app.post("/studies/{study_id}/ratios", response_model=RatioUpdateResponse)
     async def update_ratio_defs(study_id: str, request: RatioUpdateRequest) -> RatioUpdateResponse:
-        ratios = update_ratio_definitions(study_id, [entry.dict() for entry in request.ratios])
+        ratios = update_ratio_definitions(study_id, [entry.model_dump() for entry in request.ratios])
         return RatioUpdateResponse(ratios=ratios)
 
     @app.get("/studies/{study_id}/channels", response_model=ChannelUpdateResponse)
@@ -177,7 +214,7 @@ def create_app() -> FastAPI:
 
     @app.post("/studies/{study_id}/channels", response_model=ChannelUpdateResponse)
     async def update_channel_defs(study_id: str, request: ChannelUpdateRequest) -> ChannelUpdateResponse:
-        channels = update_channel_definitions(study_id, [entry.dict() for entry in request.channels])
+        channels = update_channel_definitions(study_id, [entry.model_dump() for entry in request.channels])
         return ChannelUpdateResponse(channels=channels)
 
     @app.post("/studies/{study_id}/pixel-size", response_model=PixelSizeUpdateResponse)

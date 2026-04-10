@@ -1,36 +1,37 @@
-"""Utilities for launching threshold generation runs."""
+"""Utilities for durable threshold-generation runs."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import shutil
 import numpy as np
-from fastapi import BackgroundTasks, HTTPException
-
-from image_processing import load_nd2_file
-from threshold_analysis.batch_processor import process_directory_all_thresholds
-from threshold_analysis.data_models import ThresholdResults
+from fastapi import HTTPException
 
 from data_models import GroupConfig
+from image_processing import ensure_microscopy_reader_dependencies, load_nd2_file
+from threshold_analysis.data_models import ThresholdResults
 
+from ..logging_utils import log_event
 from ..schemas import RunStatus, ThresholdRunRequest
-from ..state import RunRecord, STATE
+from ..state import RunRecord, STATE, utc_now
 from ..utils import ensure_directory, find_nd2_files, normalize_path, preview_plane_filename, slugify
 from .channels import DEFAULT_CHANNEL_DEFINITIONS, normalize_channel_definitions
 from .ratios import DEFAULT_RATIO_DEFINITIONS, normalize_ratio_definitions
 from .studies import PREVIEW_ROOT
 
 
+LOGGER = logging.getLogger(__name__)
 RUN_OUTPUT_ROOT = ensure_directory(Path(__file__).resolve().parent / "generated_results")
 
 
-def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTasks) -> RunStatus:
+def launch_threshold_run(payload: ThresholdRunRequest) -> RunStatus:
     input_dir = normalize_path(payload.input_dir).resolve()
     config_path = normalize_path(payload.config_path).resolve()
 
@@ -47,8 +48,6 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
         channel_definitions = normalize_channel_definitions(group_config.channel_definitions)
         pixel_size_um = group_config.pixel_size_um
     except Exception:
-        # Fall back to defaults when the config cannot be parsed.
-        group_config = None
         pixel_size_um = None
 
     job_id = uuid.uuid4().hex
@@ -60,12 +59,21 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
     sources_latest_mtime, source_hash, sources = _fingerprint_sources(input_dir, config_path)
     metadata_path = _metadata_path(output_path)
     try:
-        progress_total = len(find_nd2_files(input_dir))
+        microscopy_files = find_nd2_files(input_dir)
+        ensure_microscopy_reader_dependencies(microscopy_files)
+        progress_total = len(microscopy_files)
+    except ImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
         progress_total = None
+
+    preview_root = (PREVIEW_ROOT / study_slug / job_id).resolve()
     record = RunRecord(
         job_id=job_id,
+        project_id=STATE.settings.project_id,
+        session_id=STATE.settings.session_id,
         state="queued",
+        message="Run scheduled",
         input_dir=input_dir,
         config_path=config_path,
         output_path=output_path,
@@ -74,10 +82,14 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
         sources_latest_mtime=sources_latest_mtime,
         source_hash=source_hash,
         metadata_path=metadata_path,
+        preview_root=preview_root,
         ratio_definitions=ratio_definitions,
         channel_definitions=channel_definitions,
         pixel_size_um=pixel_size_um,
         progress_total=progress_total,
+        marker=payload.marker,
+        n_jobs=payload.n_jobs,
+        max_threshold=payload.max_threshold,
     )
     STATE.record_run(record)
 
@@ -85,87 +97,18 @@ def launch_threshold_run(payload: ThresholdRunRequest, background: BackgroundTas
     if reuse_result:
         return reuse_result
 
-    study_preview_dir = ensure_directory(PREVIEW_ROOT / study_slug)
-    preview_root = study_preview_dir / job_id
-    if preview_root.exists():
-        shutil.rmtree(preview_root)
-    ensure_directory(preview_root)
-    record.preview_root = preview_root.resolve()
-    STATE.update_run(job_id, preview_root=record.preview_root)
-
-    def _worker() -> None:
-        STATE.update_run(
-            job_id,
-            state="running",
-            message="Processing microscopy files",
-            progress_completed=0,
-            progress_total=record.progress_total,
-        )
-
-        def _on_progress(completed: int, total: int, label: str) -> None:
-            noun = "file" if total == 1 else "files"
-            message = f"Processed {completed}/{total} {noun}"
-            if label:
-                message = f"{message}: {label}"
-            STATE.update_run(
-                job_id,
-                state="running",
-                message=message,
-                progress_completed=completed,
-                progress_total=total,
-            )
-
-        try:
-            results = process_directory_all_thresholds(
-                input_dir=str(record.input_dir),
-                config_path=str(record.config_path),
-                output_file=str(record.output_path),
-                is_3d=payload.is_3d,
-                marker=payload.marker,
-                n_jobs=payload.n_jobs,
-                max_threshold=payload.max_threshold,
-                save_intermediate=True,
-                progress_callback=_on_progress,
-            )
-        except Exception as exc:  # pragma: no cover
-            STATE.update_run(job_id, state="failed", message=str(exc), completed_at=datetime.utcnow())
-            return
-
-        cached_preview_root = _cache_run_previews(record, results)
-        if cached_preview_root is not None:
-            record.preview_root = cached_preview_root
-            STATE.update_run(job_id, preview_root=record.preview_root)
-
-        final_mtime, final_hash, final_sources = _fingerprint_sources(record.input_dir, record.config_path)
-        _write_metadata(record.metadata_path, record, final_mtime, final_hash, final_sources)
-        STATE.update_run(
-            job_id,
-            state="succeeded",
-            message="Threshold results generated",
-            completed_at=datetime.utcnow(),
-            sources_latest_mtime=final_mtime,
-            source_hash=final_hash,
-            preview_root=record.preview_root,
-            progress_completed=record.progress_total or 0,
-            progress_total=record.progress_total,
-        )
-
-    background.add_task(_worker)
-
-    return RunStatus(
-        job_id=job_id,
-        state="queued",
-        message="Run scheduled",
-        input_dir=str(record.input_dir),
-        config_path=str(record.config_path),
-        output_path=str(record.output_path),
-        study_name=record.study_name,
-        started_at=record.started_at,
-        latest_source_mtime=_as_datetime(record.sources_latest_mtime),
-        source_hash=record.source_hash,
-        progress_completed=record.progress_completed,
-        progress_total=record.progress_total,
+    log_event(
+        LOGGER,
+        "run_queued",
+        job_id=record.job_id,
+        study_id=record.study_name,
+        project_id=record.project_id,
+        session_id=record.session_id,
+        state=record.state,
+        input_dir=str(record.input_dir) if record.input_dir else None,
+        output_path=str(record.output_path) if record.output_path else None,
     )
+    return build_run_status(record)
 
 
 def describe_run(job_id: str) -> RunStatus:
@@ -173,8 +116,12 @@ def describe_run(job_id: str) -> RunStatus:
         record = STATE.get_run(job_id)
     except KeyError as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=404, detail=f"Run not found: {job_id}") from exc
+    return build_run_status(record)
+
+
+def build_run_status(record: RunRecord) -> RunStatus:
     return RunStatus(
-        job_id=job_id,
+        job_id=record.job_id,
         state=record.state,
         message=record.message,
         input_dir=str(record.input_dir) if record.input_dir else None,
@@ -190,7 +137,18 @@ def describe_run(job_id: str) -> RunStatus:
     )
 
 
-def _cache_run_previews(record: RunRecord, results: ThresholdResults) -> Optional[Path]:
+def prepare_run_preview_root(record: RunRecord) -> Path:
+    if record.preview_root is None:
+        study_slug = slugify(record.study_name or record.job_id)
+        record.preview_root = (PREVIEW_ROOT / study_slug / record.job_id).resolve()
+    if record.preview_root.exists():
+        shutil.rmtree(record.preview_root)
+    ensure_directory(record.preview_root)
+    ensure_directory(record.preview_root / "planes")
+    return record.preview_root
+
+
+def cache_run_previews(record: RunRecord, results: ThresholdResults) -> Optional[Path]:
     if not record.preview_root or not record.input_dir:
         return None
 
@@ -227,6 +185,20 @@ def _cache_run_previews(record: RunRecord, results: ThresholdResults) -> Optiona
     return record.preview_root
 
 
+def write_run_metadata(
+    metadata_path: Optional[Path],
+    record: RunRecord,
+    latest_mtime: float,
+    source_hash: str,
+    sources: Iterable[Dict[str, object]],
+) -> None:
+    _write_metadata(metadata_path, record, latest_mtime, source_hash, sources)
+
+
+def fingerprint_run_sources(input_dir: Path, config_path: Path) -> Tuple[float, str, List[Dict[str, object]]]:
+    return _fingerprint_sources(input_dir, config_path)
+
+
 def _maybe_reuse_existing(
     reuse_existing: bool,
     record: RunRecord,
@@ -252,7 +224,8 @@ def _maybe_reuse_existing(
         preview_candidate = Path(preview_root).expanduser()
         if preview_candidate.exists():
             record.preview_root = preview_candidate.resolve()
-            STATE.update_run(record.job_id, preview_root=record.preview_root)
+            STATE.record_run(record)
+
     output_mtime = record.output_path.stat().st_mtime
     cached_mtime = metadata.get("latest_source_mtime") if metadata else None
     cached_hash = metadata.get("source_hash") if metadata else None
@@ -262,54 +235,46 @@ def _maybe_reuse_existing(
     mtime_valid = output_mtime >= latest_known if latest_known else False
 
     if hash_matches and mtime_valid:
-        completed_at = datetime.utcnow()
-        STATE.update_run(
-            record.job_id,
-            state="succeeded",
-            message="Reused cached threshold results",
-            completed_at=completed_at,
-            sources_latest_mtime=sources_latest_mtime,
-            source_hash=source_hash,
-            pixel_size_um=record.pixel_size_um,
-        )
-        return RunStatus(
+        completed_at = utc_now()
+        record.state = "succeeded"
+        record.message = "Reused cached threshold results"
+        record.completed_at = completed_at
+        record.sources_latest_mtime = sources_latest_mtime
+        record.source_hash = source_hash
+        record.pixel_size_um = record.pixel_size_um
+        STATE.record_run(record)
+        log_event(
+            LOGGER,
+            "run_reused",
             job_id=record.job_id,
-            state="succeeded",
-            message="Reused cached threshold results",
-            input_dir=str(record.input_dir),
-            config_path=str(record.config_path),
+            study_id=record.study_name,
+            project_id=record.project_id,
+            session_id=record.session_id,
+            state=record.state,
             output_path=str(record.output_path),
-            study_name=record.study_name,
-            started_at=record.started_at,
-            completed_at=completed_at,
-            latest_source_mtime=_as_datetime(sources_latest_mtime),
-            source_hash=source_hash,
         )
+        return build_run_status(record)
 
     if not metadata and sources_latest_mtime and output_mtime >= sources_latest_mtime:
-        completed_at = datetime.utcnow()
-        STATE.update_run(
-            record.job_id,
-            state="succeeded",
-            message="Reused threshold results based on modification time",
-            completed_at=completed_at,
-            sources_latest_mtime=sources_latest_mtime,
-            source_hash=source_hash,
-        )
+        completed_at = utc_now()
+        record.state = "succeeded"
+        record.message = "Reused threshold results based on modification time"
+        record.completed_at = completed_at
+        record.sources_latest_mtime = sources_latest_mtime
+        record.source_hash = source_hash
+        STATE.record_run(record)
         _write_metadata(record.metadata_path, record, sources_latest_mtime, source_hash, sources)
-        return RunStatus(
+        log_event(
+            LOGGER,
+            "run_reused",
             job_id=record.job_id,
-            state="succeeded",
-            message="Reused threshold results based on modification time",
-            input_dir=str(record.input_dir),
-            config_path=str(record.config_path),
+            study_id=record.study_name,
+            project_id=record.project_id,
+            session_id=record.session_id,
+            state=record.state,
             output_path=str(record.output_path),
-            study_name=record.study_name,
-            started_at=record.started_at,
-            completed_at=completed_at,
-            latest_source_mtime=_as_datetime(sources_latest_mtime),
-            source_hash=source_hash,
         )
+        return build_run_status(record)
 
     return None
 
@@ -321,7 +286,6 @@ def _fingerprint_sources(input_dir: Path, config_path: Path) -> Tuple[float, str
     try:
         paths.extend(find_nd2_files(input_dir))
     except Exception:
-        # If traversal fails we proceed with the config file only.
         pass
 
     hasher = hashlib.sha1()
@@ -353,7 +317,7 @@ def _load_metadata(metadata_path: Optional[Path]) -> Dict[str, object]:
     try:
         with metadata_path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
-    except Exception:  # pragma: no cover - corrupted metadata
+    except Exception:
         return {}
 
 
@@ -369,7 +333,7 @@ def _write_metadata(
     try:
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": utc_now().isoformat(),
             "input_dir": str(record.input_dir) if record.input_dir else None,
             "config_path": str(record.config_path) if record.config_path else None,
             "output_path": str(record.output_path) if record.output_path else None,
@@ -383,7 +347,7 @@ def _write_metadata(
         }
         with metadata_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
-    except Exception:  # pragma: no cover - metadata failures should not break runs
+    except Exception:
         pass
 
 

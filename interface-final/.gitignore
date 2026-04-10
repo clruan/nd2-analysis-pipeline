@@ -8,6 +8,9 @@ api/services/generated_downloads/
 api/services/generated_previews/
 api/services/generated_results/
 api/services/uploaded_inputs/
+api/runtime/
+api/venv/
+api/venv-py*/
 
 # Web artifacts
 web/node_modules/
