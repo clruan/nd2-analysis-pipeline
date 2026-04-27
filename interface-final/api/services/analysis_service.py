@@ -14,8 +14,7 @@ from threshold_analysis.data_models import ThresholdData
 
 from ..schemas import AnalyzeRequest, AnalyzeResponse, IndividualImageRecord, MouseAverageRecord
 from ..state import StudyRecord
-from .study_common import _analysis_cache_key, _ensure_ratio_columns, _get_record, _threshold_dict
-from image_processing import load_nd2_file
+from .study_common import _analysis_cache_key, _ensure_ratio_columns, _get_record, _record_channel_ids, _threshold_dict
 
 
 _ANALYSIS_LOCKS: Dict[str, Lock] = {}
@@ -31,8 +30,9 @@ def _analysis_lock_for(study_id: str) -> Lock:
         return lock
 
 
-def _build_image_index(image_data: Iterable[ThresholdData]) -> Dict[str, object]:
+def _build_image_index(image_data: Iterable[ThresholdData], channel_ids: Iterable[int]) -> Dict[str, object]:
     entries = list(image_data)
+    channel_ids = list(channel_ids)
     image_count = len(entries)
     image_groups = np.empty(image_count, dtype=object)
     image_mouse_ids = np.empty(image_count, dtype=object)
@@ -65,11 +65,11 @@ def _build_image_index(image_data: Iterable[ThresholdData]) -> Dict[str, object]
 
     subject_counts = np.bincount(image_subject_indices, minlength=len(subject_groups)).astype(np.float32, copy=False)
     channel_arrays = {
-        1: tuple(entry.channel_1_percentages for entry in entries),
-        2: tuple(entry.channel_2_percentages for entry in entries),
-        3: tuple(entry.channel_3_percentages for entry in entries),
+        channel: tuple(entry.channel_percentages.get(channel) for entry in entries)
+        for channel in channel_ids
     }
     return {
+        "channel_ids": channel_ids,
         "image_count": image_count,
         "image_groups": image_groups,
         "image_mouse_ids": image_mouse_ids,
@@ -84,46 +84,56 @@ def _build_image_index(image_data: Iterable[ThresholdData]) -> Dict[str, object]
 
 
 def _ensure_analysis_index(record: StudyRecord) -> Dict[str, object]:
-    if record.analysis_index:
+    channel_ids = _record_channel_ids(record)
+    cached_channels = record.analysis_index.get("channel_ids")
+    if record.analysis_index and cached_channels == channel_ids:
         return record.analysis_index
-    record.analysis_index = _build_image_index(record.results.image_data)
+    record.analysis_index = _build_image_index(record.results.image_data, channel_ids)
     return record.analysis_index
 
 
+def _value_at_threshold(values: Optional[np.ndarray], threshold: int) -> float:
+    if values is None or threshold < 0:
+        return 0.0
+    if threshold >= len(values):
+        return 0.0
+    return float(values[threshold])
+
+
 def _channel_values_for_threshold(index: Dict[str, object], channel: int, threshold: int) -> np.ndarray:
-    channel_arrays = index["channel_arrays"][channel]
+    channel_arrays = index["channel_arrays"].get(channel, ())
     image_count = int(index["image_count"])
-    return np.fromiter((values[threshold] for values in channel_arrays), dtype=np.float32, count=image_count)
+    return np.fromiter((_value_at_threshold(values, threshold) for values in channel_arrays), dtype=np.float32, count=image_count)
 
 
 def _channel_value_map(index: Dict[str, object], thresholds: Dict[str, int]) -> Dict[int, np.ndarray]:
     return {
-        1: _channel_values_for_threshold(index, 1, thresholds["channel_1"]),
-        2: _channel_values_for_threshold(index, 2, thresholds["channel_2"]),
-        3: _channel_values_for_threshold(index, 3, thresholds["channel_3"]),
+        channel: _channel_values_for_threshold(index, channel, thresholds.get(f"channel_{channel}", 0))
+        for channel in index["channel_ids"]
     }
 
 
-def _mouse_averages_dataframe(index: Dict[str, object], channel_values: Dict[int, np.ndarray]) -> pd.DataFrame:
+def _mouse_averages_dataframe(
+    index: Dict[str, object],
+    channel_values: Dict[int, np.ndarray],
+) -> pd.DataFrame:
     subject_indices = index["image_subject_indices"]
     subject_counts = index["subject_counts"]
     subject_count = int(subject_counts.shape[0])
-    subject_totals = np.zeros((subject_count, 3), dtype=np.float32)
+    channel_ids: List[int] = list(index["channel_ids"])
+    subject_totals = np.zeros((subject_count, len(channel_ids)), dtype=np.float32)
 
-    np.add.at(subject_totals[:, 0], subject_indices, channel_values[1])
-    np.add.at(subject_totals[:, 1], subject_indices, channel_values[2])
-    np.add.at(subject_totals[:, 2], subject_indices, channel_values[3])
+    for column_index, channel in enumerate(channel_ids):
+        np.add.at(subject_totals[:, column_index], subject_indices, channel_values[channel])
 
     subject_means = subject_totals / subject_counts[:, None]
-    return pd.DataFrame(
-        {
-            "Group": index["subject_groups"],
-            "MouseID": index["subject_mouse_ids"],
-            "Channel_1_area": subject_means[:, 0],
-            "Channel_2_area": subject_means[:, 1],
-            "Channel_3_area": subject_means[:, 2],
-        }
-    )
+    payload: Dict[str, object] = {
+        "Group": index["subject_groups"],
+        "MouseID": index["subject_mouse_ids"],
+    }
+    for column_index, channel in enumerate(channel_ids):
+        payload[f"Channel_{channel}_area"] = subject_means[:, column_index]
+    return pd.DataFrame(payload)
 
 
 def _ratio_value_arrays(
@@ -135,10 +145,20 @@ def _ratio_value_arrays(
     for ratio in ratio_definitions:
         num_idx = int(ratio["numerator_channel"])
         den_idx = int(ratio["denominator_channel"])
-        numerator = channel_values[num_idx]
-        denominator = channel_values[den_idx]
+        numerator = channel_values.get(num_idx)
+        denominator = channel_values.get(den_idx)
+        if numerator is None or denominator is None:
+            ratio_arrays[str(ratio["id"])] = np.full(0, np.nan, dtype=np.float32)
+            continue
         ratio_arrays[str(ratio["id"])] = numerator / (denominator + epsilon)
     return ratio_arrays
+
+
+def _channel_area_payload(channel_values: Dict[int, float]) -> Dict[str, float]:
+    return {
+        f"channel_{channel}_area": float(value)
+        for channel, value in sorted(channel_values.items())
+    }
 
 
 def _build_individual_image_records(
@@ -152,16 +172,18 @@ def _build_individual_image_records(
     image_mouse_ids = index["image_mouse_ids"]
     image_filenames = index["image_filenames"]
     replicate_indices = index["replicate_indices"]
+    channel_ids: List[int] = list(index["channel_ids"])
 
     return [
         IndividualImageRecord(
             group=str(image_groups[row]),
             mouse_id=str(image_mouse_ids[row]),
             filename=str(image_filenames[row]),
-            channel_1_area=float(channel_values[1][row]),
-            channel_2_area=float(channel_values[2][row]),
-            channel_3_area=float(channel_values[3][row]),
-            ratios={ratio_id: float(values[row]) for ratio_id, values in ratio_arrays.items()},
+            channel_areas=_channel_area_payload({channel: float(channel_values[channel][row]) for channel in channel_ids}),
+            ratios={
+                ratio_id: float(values[row]) if row < len(values) else float("nan")
+                for ratio_id, values in ratio_arrays.items()
+            },
             replicate_index=int(replicate_indices[row]),
         )
         for row in range(image_count)
@@ -202,27 +224,26 @@ def _analysis_tables_for_thresholds(
 
 def analyze_study(study_id: str, request: AnalyzeRequest) -> AnalyzeResponse:
     record = _get_record(study_id)
-    thresholds = _threshold_dict(request.thresholds)
-    uses_ratio_metrics = True
+    thresholds = _threshold_dict(request.thresholds, channel_ids=_record_channel_ids(record))
     mouse_averages_df, individual_images = _analysis_tables_for_thresholds(record, thresholds)
 
     mouse_records: List[MouseAverageRecord] = []
+    channel_ids = _record_channel_ids(record)
     for row in mouse_averages_df.to_dict(orient="records"):
-        ch1 = float(row.get("Channel_1_area", 0.0))
-        ch2 = float(row.get("Channel_2_area", 0.0))
-        ch3 = float(row.get("Channel_3_area", 0.0))
         ratio_values: Dict[str, float] = {}
-        if uses_ratio_metrics:
-            for ratio in record.ratio_definitions:
-                value = float(row.get(ratio["id"], 0.0))
-                ratio_values[ratio["id"]] = value
+        for ratio in record.ratio_definitions:
+            value = row.get(ratio["id"])
+            if isinstance(value, (int, float, np.floating)):
+                ratio_values[str(ratio["id"])] = float(value)
+        channel_areas = {
+            f"channel_{channel}_area": float(row.get(f"Channel_{channel}_area", 0.0))
+            for channel in channel_ids
+        }
         mouse_records.append(
             MouseAverageRecord(
                 Group=str(row.get("Group", "")),
                 MouseID=str(row.get("MouseID", "")),
-                Channel_1_area=ch1,
-                Channel_2_area=ch2,
-                Channel_3_area=ch3,
+                channel_areas=channel_areas,
                 ratios=ratio_values,
             )
         )
@@ -240,8 +261,11 @@ def _collect_replicate_metrics(
     thresholds: Dict[str, int],
     ratio_definitions: List[Dict[str, object]],
 ) -> List[IndividualImageRecord]:
-    index = _build_image_index(image_data)
-    channel_values = _channel_value_map(index, thresholds)
+    entries = list(image_data)
+    channel_ids = sorted({channel for entry in entries for channel in entry.channel_ids}) or [1, 2, 3]
+    normalized_thresholds = _threshold_dict(thresholds, channel_ids=channel_ids)
+    index = _build_image_index(entries, channel_ids)
+    channel_values = _channel_value_map(index, normalized_thresholds)
     return _build_individual_image_records(index, channel_values, ratio_definitions)
 
 
@@ -254,142 +278,3 @@ def _resolve_source_image_path(record: StudyRecord, mouse_id: str, filename: str
         if candidate and candidate.exists():
             return candidate
     return None
-
-
-def _apply_optional_denoise(channel: np.ndarray, sigma: Optional[float]) -> np.ndarray:
-    if sigma is None:
-        return channel.astype(np.float32, copy=False)
-    try:
-        from scipy.ndimage import gaussian_filter
-    except Exception:
-        return channel.astype(np.float32, copy=False)
-    return gaussian_filter(channel.astype(np.float32, copy=False), sigma=sigma)
-
-
-def _positive_intensity(channel: np.ndarray, threshold: int) -> float:
-    if channel is None:
-        return 0.0
-    array = np.asarray(channel, dtype=np.float32)
-    positive = array[array > float(threshold)]
-    if positive.size == 0:
-        return 0.0
-    return float(np.sum(positive))
-
-
-def _colocalization_intensity_metric(
-    channel_a: np.ndarray, channel_b: np.ndarray, threshold_a: int, threshold_b: int
-) -> float:
-    a = np.asarray(channel_a, dtype=np.float32)
-    b = np.asarray(channel_b, dtype=np.float32)
-    mask = (a > float(threshold_a)) | (b > float(threshold_b))
-    if not np.any(mask):
-        return 0.0
-    values_a = a[mask].ravel()
-    values_b = b[mask].ravel()
-    if values_a.size < 3:
-        return 0.0
-    std_a = float(np.std(values_a))
-    std_b = float(np.std(values_b))
-    if std_a < 1e-8 or std_b < 1e-8:
-        return 0.0
-    corr = float(np.corrcoef(values_a, values_b)[0, 1])
-    if not np.isfinite(corr):
-        return 0.0
-    return corr
-
-
-def _colocalization_overlap_metric(
-    channel_a: np.ndarray, channel_b: np.ndarray, threshold_a: int, threshold_b: int
-) -> float:
-    a = np.asarray(channel_a)
-    b = np.asarray(channel_b)
-    mask_a = a > float(threshold_a)
-    mask_b = b > float(threshold_b)
-    union = np.logical_or(mask_a, mask_b)
-    union_count = int(np.sum(union))
-    if union_count == 0:
-        return 0.0
-    intersection_count = int(np.sum(np.logical_and(mask_a, mask_b)))
-    return float((intersection_count / union_count) * 100.0)
-
-
-def _collect_replicate_mode_metrics(
-    record: StudyRecord,
-    thresholds: Dict[str, int],
-    ratio_definitions: List[Dict[str, object]],
-    analysis_mode: str,
-    denoise_sigma: Optional[float],
-) -> List[IndividualImageRecord]:
-    records: List[IndividualImageRecord] = []
-    replicate_counters: Counter[Tuple[str, str]] = Counter()
-    stack_modes = {"positive_intensity_stack_sum", "coloc_intensity_3d", "coloc_overlap_3d"}
-    projection = "none" if analysis_mode in stack_modes else "max"
-    uses_ratio_metrics = analysis_mode.startswith("positive_")
-
-    for entry in record.results.image_data:
-        source_path = _resolve_source_image_path(record, entry.mouse_id, entry.filename)
-        if source_path is None:
-            continue
-
-        try:
-            ch1, ch2, ch3 = load_nd2_file(str(source_path), is_3d=record.is_3d, projection=projection)
-        except Exception:
-            continue
-
-        channels = {
-            1: _apply_optional_denoise(np.asarray(ch1), denoise_sigma),
-            2: _apply_optional_denoise(np.asarray(ch2), denoise_sigma),
-            3: _apply_optional_denoise(np.asarray(ch3), denoise_sigma),
-        }
-
-        if analysis_mode.startswith("positive_intensity_"):
-            channel_values = {
-                1: _positive_intensity(channels[1], thresholds["channel_1"]),
-                2: _positive_intensity(channels[2], thresholds["channel_2"]),
-                3: _positive_intensity(channels[3], thresholds["channel_3"]),
-            }
-        elif analysis_mode.startswith("coloc_intensity_"):
-            channel_values = {
-                1: _colocalization_intensity_metric(channels[1], channels[2], thresholds["channel_1"], thresholds["channel_2"]),
-                2: _colocalization_intensity_metric(channels[1], channels[3], thresholds["channel_1"], thresholds["channel_3"]),
-                3: _colocalization_intensity_metric(channels[2], channels[3], thresholds["channel_2"], thresholds["channel_3"]),
-            }
-        elif analysis_mode.startswith("coloc_overlap_"):
-            channel_values = {
-                1: _colocalization_overlap_metric(channels[1], channels[2], thresholds["channel_1"], thresholds["channel_2"]),
-                2: _colocalization_overlap_metric(channels[1], channels[3], thresholds["channel_1"], thresholds["channel_3"]),
-                3: _colocalization_overlap_metric(channels[2], channels[3], thresholds["channel_2"], thresholds["channel_3"]),
-            }
-        else:
-            channel_values = {
-                1: float(entry.get_percentage_at_threshold(1, thresholds["channel_1"])),
-                2: float(entry.get_percentage_at_threshold(2, thresholds["channel_2"])),
-                3: float(entry.get_percentage_at_threshold(3, thresholds["channel_3"])),
-            }
-
-        ratio_values: Dict[str, float] = {}
-        if uses_ratio_metrics:
-            for ratio in ratio_definitions:
-                num_idx = int(ratio["numerator_channel"])
-                den_idx = int(ratio["denominator_channel"])
-                numerator = channel_values.get(num_idx, 0.0)
-                denominator = channel_values.get(den_idx, 0.0)
-                ratio_values[ratio["id"]] = float(numerator / (denominator + 1e-6))
-
-        key = (entry.group, entry.mouse_id)
-        replicate_counters[key] += 1
-        replicate_index = replicate_counters[key]
-        records.append(
-            IndividualImageRecord(
-                group=str(entry.group),
-                mouse_id=str(entry.mouse_id),
-                filename=str(entry.filename),
-                channel_1_area=float(channel_values.get(1, 0.0)),
-                channel_2_area=float(channel_values.get(2, 0.0)),
-                channel_3_area=float(channel_values.get(3, 0.0)),
-                ratios=ratio_values,
-                replicate_index=replicate_index,
-            )
-        )
-
-    return records

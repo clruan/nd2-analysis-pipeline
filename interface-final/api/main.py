@@ -158,6 +158,10 @@ def create_app() -> FastAPI:
             "nd2_available": study_has_preview_sources(record.study_id),
             "ratio_definitions": record.ratio_definitions,
             "channel_definitions": record.channel_definitions,
+            "channel_limits": {
+                f"channel_{channel}": limit for channel, limit in record.results.channel_limits.items()
+            },
+            "max_threshold": record.results.max_threshold,
             "pixel_size_um": record.pixel_size_um,
         }
 

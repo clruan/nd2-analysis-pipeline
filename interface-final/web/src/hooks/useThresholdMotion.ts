@@ -9,10 +9,6 @@ const SUBJECT_MOVE_START = 0.28;
 const SUBJECT_MOVE_END = 0.78;
 const REPLICA_HIDE_START = 0.82;
 
-const CHANNEL_KEYS = ["channel_1_area", "channel_2_area", "channel_3_area"] as const;
-
-type ChannelKey = (typeof CHANNEL_KEYS)[number];
-
 export type ThresholdMotionStage = {
   replicaVisibility: number;
   replicaProgress: number;
@@ -43,8 +39,10 @@ const easeInOutCubic = (value: number) =>
 
 const interpolateNumber = (from: number, to: number, progress: number) => from + (to - from) * progress;
 
-export const thresholdsEqual = (left: Record<string, number>, right: Record<string, number>) =>
-  left.channel_1 === right.channel_1 && left.channel_2 === right.channel_2 && left.channel_3 === right.channel_3;
+export const thresholdsEqual = (left: Record<string, number>, right: Record<string, number>) => {
+  const keys = Array.from(new Set([...Object.keys(left), ...Object.keys(right)])).sort();
+  return keys.every((key) => left[key] === right[key]);
+};
 
 const buildRatioKeys = (fromRatios?: Record<string, number>, toRatios?: Record<string, number>) =>
   Array.from(new Set([...Object.keys(fromRatios ?? {}), ...Object.keys(toRatios ?? {})]));
@@ -99,6 +97,33 @@ export const getThresholdMotionStage = (progress: number): ThresholdMotionStage 
   };
 };
 
+const buildChannelAreaKeys = (
+  fromAreas?: Record<string, number>,
+  toAreas?: Record<string, number>
+) => Array.from(new Set([...Object.keys(fromAreas ?? {}), ...Object.keys(toAreas ?? {})])).sort();
+
+const interpolateChannelAreas = (
+  fromAreas: Record<string, number> | undefined,
+  toAreas: Record<string, number> | undefined,
+  progress: number
+) =>
+  buildChannelAreaKeys(fromAreas, toAreas).reduce<Record<string, number>>((acc, key) => {
+    const target = toAreas?.[key];
+    const start = fromAreas?.[key];
+    if (typeof target !== "number" || !Number.isFinite(target)) {
+      if (typeof start === "number" && Number.isFinite(start)) {
+        acc[key] = start;
+      }
+      return acc;
+    }
+    if (typeof start !== "number" || !Number.isFinite(start)) {
+      acc[key] = target;
+      return acc;
+    }
+    acc[key] = interpolateNumber(start, target, progress);
+    return acc;
+  }, {});
+
 const interpolateMouseAverage = (
   fromRecord: MouseAverageRecord | undefined,
   toRecord: MouseAverageRecord,
@@ -111,19 +136,8 @@ const interpolateMouseAverage = (
   const nextRecord: MouseAverageRecord = {
     Group: toRecord.Group,
     MouseID: toRecord.MouseID,
-    Channel_1_area: toRecord.Channel_1_area,
-    Channel_2_area: toRecord.Channel_2_area,
-    Channel_3_area: toRecord.Channel_3_area
+    channel_areas: interpolateChannelAreas(fromRecord.channel_areas, toRecord.channel_areas, progress)
   };
-
-  CHANNEL_KEYS.forEach((key) => {
-    const sourceKey = key.replace("channel_", "Channel_") as keyof MouseAverageRecord;
-    const fromValue = fromRecord[sourceKey];
-    const toValue = toRecord[sourceKey];
-    if (typeof fromValue === "number" && typeof toValue === "number") {
-      nextRecord[sourceKey] = interpolateNumber(fromValue, toValue, progress) as never;
-    }
-  });
 
   const ratios = interpolateRatios(fromRecord.ratios, toRecord.ratios, progress);
   if (Object.keys(ratios).length > 0) {
@@ -144,12 +158,9 @@ const interpolateIndividualImage = (
 
   const nextRecord: IndividualImageRecord = {
     ...toRecord,
+    channel_areas: interpolateChannelAreas(fromRecord.channel_areas, toRecord.channel_areas, progress),
     ratios: {}
   };
-
-  CHANNEL_KEYS.forEach((key: ChannelKey) => {
-    nextRecord[key] = interpolateNumber(fromRecord[key], toRecord[key], progress);
-  });
 
   nextRecord.ratios = interpolateRatios(fromRecord.ratios, toRecord.ratios, progress);
 

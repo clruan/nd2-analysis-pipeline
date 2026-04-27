@@ -5,14 +5,14 @@ import matplotlib.patches as patches
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 import os
 from pathlib import Path
 import logging
 import re
 from matplotlib.colors import LinearSegmentedColormap
 
-from image_processing import load_nd2_file, parse_mouse_id
+from image_processing import load_microscopy_channels, parse_mouse_id
 from data_models import VisualizationConfig
 from config import VISUALIZATION_RANGES, CHANNEL_COLORS, DEFAULT_MARKER, DEFAULT_MARKER_2D
 
@@ -100,16 +100,28 @@ class ND2Visualizer:
 
     def _build_channel_display(self, channel_definitions: Optional[List[Dict[str, object]]]) -> Dict[str, Dict[str, object]]:
         display = {key: dict(value) for key, value in DEFAULT_CHANNEL_DISPLAY.items()}
+
+        max_defined_channel = max(
+            [int(entry.get("channel")) for entry in (channel_definitions or []) if entry.get("channel") is not None] or [3]
+        )
+        for channel in range(4, max_defined_channel + 1):
+            key = f"channel_{channel}"
+            display.setdefault(
+                key,
+                {
+                    "label": f"Channel {channel}",
+                    "color": _normalize_color("#ffffff", "#ffffff"),
+                },
+            )
         for entry in channel_definitions or []:
             try:
                 channel = int(entry.get("channel"))
             except Exception:
                 continue
             key = f"channel_{channel}"
-            if key not in display:
-                continue
-            label = str(entry.get("label") or display[key]["label"]).strip() or str(display[key]["label"])
-            color = _normalize_color(str(entry.get("color") or display[key]["color"]), str(display[key]["color"]))
+            current = display.get(key, {"label": f"Channel {channel}", "color": "#ffffff"})
+            label = str(entry.get("label") or current["label"]).strip() or str(current["label"])
+            color = _normalize_color(str(entry.get("color") or current["color"]), str(current["color"]))
             display[key] = {"label": label, "color": color}
 
         for key, value in display.items():
@@ -117,8 +129,8 @@ class ND2Visualizer:
             value["cmap"] = LinearSegmentedColormap.from_list(f"{key}_cmap", ["black", color])
         return display
         
-    def add_scale_bar(self, ax, image_shape: Tuple[int, int], 
-                     scale_bar_um: float = None, 
+    def add_scale_bar(self, ax, image_shape: Tuple[int, int],
+                     scale_bar_um: float = None,
                      pixel_size_um: float = None) -> None:
         """
         Add a scale bar to an image with adaptive placement.
@@ -133,6 +145,8 @@ class ND2Visualizer:
         
         if pixel_size_um is None or pixel_size_um <= 0:
             pixel_size_um = self.pixel_size_um
+        if pixel_size_um is None or pixel_size_um <= 0:
+            return
         
         height, width = image_shape
         if height == 0 or width == 0:
@@ -140,9 +154,10 @@ class ND2Visualizer:
         
         scale_bar_pixels = max(1, int(round(requested_um / pixel_size_um)))
         
+        left_pad = 5
         margin_x = max(12, int(width * 0.05))
         margin_y = max(18, int(height * 0.08))
-        max_bar_pixels = max(5, width - margin_x - 5)
+        max_bar_pixels = max(5, width - margin_x - left_pad)
         if scale_bar_pixels > max_bar_pixels:
             scale_bar_pixels = max_bar_pixels
             effective_scale_um = round(scale_bar_pixels * pixel_size_um, 2)
@@ -151,10 +166,11 @@ class ND2Visualizer:
         
         # Set bar geometry
         bar_height = max(self.config.scale_bar_thickness, int(max(height, width) * 0.01))
-        x_start = width - margin_x - scale_bar_pixels
+        x_end = width - margin_x
+        x_start = x_end - scale_bar_pixels
         y_start = height - margin_y - bar_height
-        x_start = max(5, x_start)
-        y_start = max(5, y_start)
+        x_start = max(left_pad, x_start)
+        y_start = max(left_pad, y_start)
         
         scale_bar = patches.Rectangle(
             (x_start, y_start), scale_bar_pixels, bar_height,
@@ -163,42 +179,51 @@ class ND2Visualizer:
         )
         ax.add_patch(scale_bar)
         
-        # Label below the bar, stay inside frame
+        # Right-align and auto-fit the label so it stays inside the frame on narrow exports.
+        label_text = f'{effective_scale_um:g} μm'
         label_offset = max(8, int(max(height, width) * 0.024))
         label_y = min(height - 8, y_start + bar_height + label_offset)
-        font_size_override = getattr(self.config, 'scale_bar_font_size', None)
+        font_size_override = self.config.scale_bar_font_size
         if font_size_override is not None:
-            font_size = font_size_override
+            font_size = int(font_size_override)
         else:
             font_size = max(7, min(16, int(min(height, width) * 0.02)))
+        label_x = max(left_pad, min(width - left_pad, x_end))
+        available_label_width = max(20, label_x - left_pad)
+        max_font_for_width = max(6, int(available_label_width / max(len(label_text) * 0.62, 1)))
+        font_size = max(6, min(font_size, max_font_for_width))
         ax.text(
-            x_start + scale_bar_pixels / 2,
+            label_x,
             label_y,
-            f'{effective_scale_um:g} μm',
+            label_text,
             fontsize=font_size,
             color=self.config.scale_bar_color,
-            ha='center',
+            ha='right',
             va='top',
             weight='bold'
         )
 
-    def _resolve_panel_order(self, panel_order: Optional[List[str]]) -> List[str]:
+    def _resolve_panel_order(self, panel_order: Optional[List[str]], channel_ids: Iterable[int]) -> List[str]:
         """Validate and normalize requested panel ordering."""
-        default_order = ['channel_1', 'channel_2', 'channel_3', 'composite']
+        ordered_channels = [f"channel_{channel}" for channel in sorted({int(channel) for channel in channel_ids if int(channel) > 0})]
+        default_order = ordered_channels + ['composite']
         if not panel_order:
             return default_order
         normalized = []
         for panel in panel_order:
-            if panel in {'channel_1', 'channel_2', 'channel_3', 'composite'} and panel not in normalized:
+            if panel in set(default_order) and panel not in normalized:
                 normalized.append(panel)
         return normalized or default_order
 
-    def _resolve_channel_ranges(self, overrides: Optional[Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
+    def _resolve_channel_ranges(
+        self,
+        overrides: Optional[Dict[str, Dict[str, float]]],
+        channel_ids: Iterable[int],
+    ) -> Dict[str, Dict[str, float]]:
         """Merge override ranges with defaults."""
         resolved = {
-            'channel_1': dict(self.viz_ranges.get('channel_1', {'vmin': 0, 'vmax': 4095})),
-            'channel_2': dict(self.viz_ranges.get('channel_2', {'vmin': 0, 'vmax': 4095})),
-            'channel_3': dict(self.viz_ranges.get('channel_3', {'vmin': 0, 'vmax': 4095}))
+            f'channel_{channel}': dict(self.viz_ranges.get(f'channel_{channel}', {'vmin': 0, 'vmax': 4095}))
+            for channel in sorted({int(channel) for channel in channel_ids if int(channel) > 0})
         }
         if overrides:
             for channel, values in overrides.items():
@@ -219,18 +244,23 @@ class ND2Visualizer:
         channels: Dict[str, np.ndarray],
         resolved_ranges: Dict[str, Dict[str, float]],
         add_scale_bar: bool,
-        composite_cache: Dict[str, np.ndarray]
+        composite_cache: Dict[str, np.ndarray],
+        composite_channels: Iterable[int],
     ) -> None:
         """Render a single panel into the provided axis."""
         ax.axis('off')
         if panel_id == 'composite':
-            if 'composite' not in composite_cache:
+            composite_key = "composite:" + ",".join(str(channel) for channel in composite_channels)
+            if composite_key not in composite_cache:
                 composite_cache['composite'] = self._create_rgb_composite(
-                    channels['channel_1'], channels['channel_2'], channels['channel_3'], resolved_ranges
+                    channels,
+                    resolved_ranges,
+                    composite_channels,
                 )
-            ax.imshow(composite_cache['composite'])
+                composite_cache[composite_key] = composite_cache['composite']
+            ax.imshow(composite_cache[composite_key])
             if add_scale_bar:
-                self.add_scale_bar(ax, composite_cache['composite'].shape[:2])
+                self.add_scale_bar(ax, composite_cache[composite_key].shape[:2])
             return
         channel_data = channels.get(panel_id)
         cmap = self.channel_display.get(panel_id, {}).get("cmap", "gray")
@@ -243,14 +273,15 @@ class ND2Visualizer:
 
     def visualize_channels(
         self,
-        channel_1: np.ndarray,
-        channel_2: np.ndarray, 
-        channel_3: np.ndarray,
+        channels: Union[Dict[int, np.ndarray], np.ndarray],
+        channel_2: Optional[np.ndarray] = None,
+        channel_3: Optional[np.ndarray] = None,
         title: str = None,
         save_path: Optional[str] = None,
         add_scale_bar: bool = True,
         panel_order: Optional[List[str]] = None,
-        channel_ranges: Optional[Dict[str, Dict[str, float]]] = None
+        channel_ranges: Optional[Dict[str, Dict[str, float]]] = None,
+        composite_channels: Optional[Iterable[int]] = None,
     ) -> plt.Figure:
         """
         Visualize the three channels of an ND2 image.
@@ -266,23 +297,40 @@ class ND2Visualizer:
         Returns:
             matplotlib Figure object
         """
-        order = self._resolve_panel_order(panel_order)
-        resolved_ranges = self._resolve_channel_ranges(channel_ranges)
+        if isinstance(channels, dict):
+            channel_map = {f'channel_{channel}': array for channel, array in sorted(channels.items())}
+        else:
+            if channel_2 is None or channel_3 is None:
+                raise ValueError("visualize_channels requires channel_2 and channel_3 when the first argument is an array.")
+            channel_map = {
+                'channel_1': channels,
+                'channel_2': channel_2,
+                'channel_3': channel_3,
+            }
+        channel_ids = [int(key.split("_")[1]) for key in channel_map]
+        resolved_composite_channels = list(
+            composite_channels if composite_channels is not None else channel_ids
+        ) or channel_ids
+        order = self._resolve_panel_order(panel_order, channel_ids)
+        resolved_ranges = self._resolve_channel_ranges(channel_ranges, channel_ids)
         base_width, base_height = self.config.figure_size
-        width_scale = max(len(order) / 4, 0.5)
+        width_scale = max(len(order) / max(len(channel_ids) + 1, 1), 0.5)
         fig_width = max(4, base_width * width_scale)
         fig, axs = plt.subplots(1, len(order), figsize=(fig_width, base_height))
         if len(order) == 1:
             axs = [axs]
-        
-        channel_map = {
-            'channel_1': channel_1,
-            'channel_2': channel_2,
-            'channel_3': channel_3
-        }
+
         composite_cache: Dict[str, np.ndarray] = {}
         for axis, panel_id in zip(axs, order):
-            self._render_panel(axis, panel_id, channel_map, resolved_ranges, add_scale_bar, composite_cache)
+            self._render_panel(
+                axis,
+                panel_id,
+                channel_map,
+                resolved_ranges,
+                add_scale_bar,
+                composite_cache,
+                resolved_composite_channels,
+            )
         
         # Only add title if explicitly provided (not for representative images)
         if title:
@@ -298,10 +346,9 @@ class ND2Visualizer:
 
     def _create_rgb_composite(
         self,
-        channel_1: np.ndarray,
-        channel_2: np.ndarray,
-        channel_3: np.ndarray,
+        channels: Dict[str, np.ndarray],
         resolved_ranges: Dict[str, Dict[str, float]],
+        composite_channels: Iterable[int],
     ) -> np.ndarray:
         """
         Create RGB composite image from three channels.
@@ -314,15 +361,15 @@ class ND2Visualizer:
         Returns:
             RGB composite image
         """
-        rgb = np.zeros((channel_1.shape[0], channel_1.shape[1], 3), dtype=np.float32)
+        active_keys = [f"channel_{channel}" for channel in composite_channels if f"channel_{channel}" in channels]
+        if not active_keys:
+            raise ValueError("Composite render requested without any available channels.")
+        first_channel = channels[active_keys[0]]
+        rgb = np.zeros((first_channel.shape[0], first_channel.shape[1], 3), dtype=np.float32)
         
         # Normalize each channel to [0, 1]
-        channels = {
-            "channel_1": channel_1,
-            "channel_2": channel_2,
-            "channel_3": channel_3,
-        }
-        for key, channel in channels.items():
+        for key in active_keys:
+            channel = channels[key]
             normalized = self._normalize_channel(channel, resolved_ranges[key])
             red, green, blue = _color_rgb(str(self.channel_display[key]["color"]))
             rgb[:, :, 0] += normalized * red
@@ -362,17 +409,14 @@ class ND2Visualizer:
         """
         try:
             # Load image data
-            channel_1, channel_2, channel_3 = load_nd2_file(filepath, is_3d)
-            channel_map = {
-                'channel_1': channel_1,
-                'channel_2': channel_2,
-                'channel_3': channel_3
-            }
-            resolved_ranges = self._resolve_channel_ranges(channel_ranges)
+            loaded_channels = load_microscopy_channels(filepath, is_3d)
+            channel_map = {f"channel_{channel}": array for channel, array in loaded_channels.items()}
+            channel_ids = [int(key.split("_")[1]) for key in channel_map]
+            resolved_ranges = self._resolve_channel_ranges(channel_ranges, channel_ids)
             
             # Create visualization
             fig = self.visualize_channels(
-                channel_1, channel_2, channel_3,
+                loaded_channels,
                 title=title, save_path=output_path,
                 panel_order=panel_order,
                 channel_ranges=channel_ranges
@@ -380,7 +424,7 @@ class ND2Visualizer:
             if extra_outputs:
                 composite_cache: Dict[str, np.ndarray] = {}
                 for variant, path in extra_outputs.items():
-                    if variant not in {'channel_1', 'channel_2', 'channel_3', 'composite'}:
+                    if variant not in set(channel_map) | {'composite'}:
                         continue
                     self._save_single_panel(
                         channel_map,
@@ -388,7 +432,8 @@ class ND2Visualizer:
                         path,
                         resolved_ranges,
                         composite_cache,
-                        add_scale_bar=True
+                        add_scale_bar=True,
+                        composite_channels=channel_ids,
                     )
             
             plt.close(fig)  # Free memory
@@ -532,11 +577,20 @@ class ND2Visualizer:
         save_path: str,
         resolved_ranges: Dict[str, Dict[str, float]],
         composite_cache: Dict[str, np.ndarray],
-        add_scale_bar: bool = True
+        add_scale_bar: bool = True,
+        composite_channels: Optional[Iterable[int]] = None,
     ) -> None:
         """Save a single panel variant to disk."""
         fig, ax = plt.subplots(1, 1, figsize=(max(4, self.config.figure_size[0] / 4), self.config.figure_size[1]))
-        self._render_panel(ax, variant, channels, resolved_ranges, add_scale_bar, composite_cache)
+        self._render_panel(
+            ax,
+            variant,
+            channels,
+            resolved_ranges,
+            add_scale_bar,
+            composite_cache,
+            composite_channels or [int(key.split("_")[1]) for key in channels],
+        )
         plt.tight_layout()
         plt.savefig(save_path, dpi=self.config.dpi, bbox_inches='tight')
         plt.close(fig)

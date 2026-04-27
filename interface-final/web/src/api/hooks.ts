@@ -23,8 +23,14 @@ import type {
 
 const DEFAULT_ANALYSIS_MODE = "positive_area_percent" as const;
 
-export type ChannelRangePayload = Partial<Record<"channel_1" | "channel_2" | "channel_3", { vmin: number; vmax: number }>>;
+export type ChannelRangePayload = Partial<Record<string, { vmin: number; vmax: number }>>;
 type PreviewPrioritySubjectPayload = { group: string; subject_id: string; filename: string };
+
+const thresholdsSignature = (thresholds: Record<string, number>) =>
+  Object.entries(thresholds)
+    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }))
+    .map(([key, value]) => `${key}:${value}`)
+    .join("|");
 
 export function useConfigScan() {
   return useMutation({
@@ -101,9 +107,7 @@ export function useAnalysisQuery(
     queryKey: [
       "analysis",
       studyId,
-      thresholds.channel_1,
-      thresholds.channel_2,
-      thresholds.channel_3,
+      thresholdsSignature(thresholds),
       DEFAULT_ANALYSIS_MODE
     ],
     queryFn: () =>
@@ -139,9 +143,7 @@ export function useStatisticsQuery(
     queryKey: [
       "statistics",
       studyId,
-      thresholds.channel_1,
-      thresholds.channel_2,
-      thresholds.channel_3,
+      thresholdsSignature(thresholds),
       options.comparisonMode,
       options.referenceGroup ?? "none",
       pairsKey,
@@ -204,9 +206,7 @@ export function usePreviewQuery(
       "previews",
       studyId,
       phase,
-      thresholds.channel_1,
-      thresholds.channel_2,
-      thresholds.channel_3,
+      thresholdsSignature(thresholds),
       metricsKey,
       groups?.join("|") ?? "all",
       sampleCount,
@@ -277,8 +277,10 @@ export function usePreviewDownload(studyId: string | null) {
       filename: string;
       thresholds: Record<string, number>;
       panel_order: string[];
+      composite_channels?: number[];
       channel_ranges?: ChannelRangePayload;
       scale_bar_um?: number;
+      scale_bar_font_size?: number;
     }) => {
       if (!studyId) {
         return Promise.reject(new Error("Study not loaded"));

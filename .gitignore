@@ -77,11 +77,13 @@ output/
 results/
 data/
 *.nd2
+*.czi
 
 # Private data and study-specific results (keep local)
 examples/configs/ATIII_study1_kidney.json
 examples/configs/C1inh_lung_study2.json
 examples/configs/JB_skin.json
+examples/configs/net_formation_10302025.json
 threshold_results_*.json
 intermediate_results_*.json
 

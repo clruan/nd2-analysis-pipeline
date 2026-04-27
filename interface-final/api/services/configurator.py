@@ -27,7 +27,7 @@ from ..schemas import (
     SubjectInfo,
 )
 from ..utils import assign_subject_ids, ensure_directory, find_nd2_files, normalize_path, slugify
-from .channels import normalize_channel_definitions
+from .channels import detect_channel_definitions_from_dir, normalize_channel_definitions
 from .ratios import normalize_ratio_definitions
 
 
@@ -64,12 +64,14 @@ def scan_input_directory(request: ConfigScanRequest) -> ConfigScanResponse:
         group_infos.append(GroupInfo(group_name=group_name, subjects=subject_infos))
 
     study_name = input_dir.name
+    channel_definitions = detect_channel_definitions_from_dir(input_dir)
 
     return ConfigScanResponse(
         study_name=study_name,
         input_dir=str(input_dir),
         nd2_files=[str(path) for path in nd2_files],
         groups=group_infos,
+        channel_definitions=channel_definitions,
     )
 
 
@@ -84,8 +86,9 @@ def create_config(request: ConfigCreateRequest) -> ConfigCreateResponse:
 
     ratio_entries = [ratio.dict() for ratio in request.ratios] if request.ratios else None
     channel_entries = [channel.dict() for channel in request.channel_definitions] if request.channel_definitions else None
+    detected_channels = detect_channel_definitions_from_dir(input_dir) if not channel_entries else None
     normalized_ratios = normalize_ratio_definitions(ratio_entries)
-    normalized_channels = normalize_channel_definitions(channel_entries)
+    normalized_channels = normalize_channel_definitions(channel_entries or detected_channels)
 
     group_config = GroupConfig(
         groups=request.groups,

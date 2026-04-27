@@ -38,15 +38,11 @@ import {
 } from "../api/hooks";
 import type { ChannelDefinition, ConfigScanResponse, RatioDefinition } from "../api/types";
 import {
+  buildDefaultChannelDefinitions,
   DEFAULT_CHANNEL_DEFINITIONS,
   DEFAULT_RATIO_DEFINITIONS,
   normalizeChannelDefinitions
 } from "../constants/metrics";
-
-const sliderMarks = [0, 1000, 2000, 3000, 4000].map((value) => ({
-  value,
-  label: String(value)
-}));
 
 const defaultPalette = [
   "#2563eb",
@@ -104,11 +100,9 @@ type ModuleId =
   | "visualization_settings"
   | "threshold_generation"
   | "study_loader";
-type ChannelKey = "channel_1" | "channel_2" | "channel_3";
+type ChannelKey = string;
 type ChannelWindowDraft = { min: string; threshold: string; max: string };
 type ChannelWindowCommitSource = "min" | "threshold" | "max";
-
-const channelKeys: ChannelKey[] = ["channel_1", "channel_2", "channel_3"];
 
 const baseSectionSx = {
   borderRadius: 2,
@@ -173,7 +167,7 @@ const getErrorMessage = (error: unknown) => {
   return typeof error === "string" ? error : JSON.stringify(error);
 };
 
-const clampIntensity = (value: number) => Math.max(0, Math.min(4095, Math.round(value)));
+const clampIntensity = (value: number, max: number) => Math.max(0, Math.min(max, Math.round(value)));
 
 const parseIntensityDraft = (value: string): number | null => {
   const trimmed = value.trim();
@@ -184,21 +178,21 @@ const parseIntensityDraft = (value: string): number | null => {
   if (!Number.isFinite(parsed)) {
     return null;
   }
-  return clampIntensity(parsed);
+  return clampIntensity(parsed, Number.MAX_SAFE_INTEGER);
 };
 
 const buildChannelWindowDrafts = (
-  ranges: Record<ChannelKey, [number, number]>,
+  ranges: Record<string, [number, number]>,
   thresholds: Record<string, number>
-): Record<ChannelKey, ChannelWindowDraft> =>
-  channelKeys.reduce<Record<ChannelKey, ChannelWindowDraft>>((acc, channel) => {
+): Record<string, ChannelWindowDraft> =>
+  Object.keys(ranges).reduce<Record<string, ChannelWindowDraft>>((acc, channel) => {
     acc[channel] = {
       min: String(ranges[channel][0]),
-      threshold: String(thresholds[channel]),
-      max: String(ranges[channel][1]),
+      threshold: String(thresholds[channel] ?? 0),
+      max: String(ranges[channel][1])
     };
     return acc;
-  }, {} as Record<ChannelKey, ChannelWindowDraft>);
+  }, {});
 
 const sliderValueFromDraft = (
   range: [number, number],
@@ -293,8 +287,8 @@ export default function LeftPanel() {
     threshold_generation: false,
     study_loader: false,
   });
-  const [channelWindowDrafts, setChannelWindowDrafts] = useState<Record<ChannelKey, ChannelWindowDraft>>(() =>
-    buildChannelWindowDrafts(previewChannelRanges as Record<ChannelKey, [number, number]>, thresholds)
+  const [channelWindowDrafts, setChannelWindowDrafts] = useState<Record<string, ChannelWindowDraft>>(() =>
+    buildChannelWindowDrafts(previewChannelRanges, thresholds)
   );
 
   const scanMutation = useConfigScan();
@@ -310,11 +304,7 @@ export default function LeftPanel() {
   const pixelSizeMutation = usePixelSizeUpdate(study?.study_id ?? null);
   const configInputRef = useRef<HTMLInputElement>(null);
   const resultsInputRef = useRef<HTMLInputElement>(null);
-  const activeSliderThumbRef = useRef<Record<ChannelKey, number>>({
-    channel_1: 1,
-    channel_2: 1,
-    channel_3: 1,
-  });
+  const activeSliderThumbRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     return () => {
@@ -454,6 +444,8 @@ export default function LeftPanel() {
   };
 
   const statsControlsDisabled = !statisticsEnabled || studyGroups.length === 0;
+  const getChannelLimit = (channel: string) =>
+    Math.max(1, study?.channel_limits?.[channel] ?? study?.max_threshold ?? previewChannelRanges[channel]?.[1] ?? 4095);
 
   useEffect(() => {
     if (!studyGroups.length) {
@@ -591,7 +583,7 @@ export default function LeftPanel() {
     if (Number.isNaN(numeric)) {
       return undefined;
     }
-    return Math.max(1, Math.min(3, Math.round(numeric)));
+    return Math.max(1, Math.round(numeric));
   };
 
   const updateRatioDraft = (
@@ -637,7 +629,10 @@ export default function LeftPanel() {
         id: `custom_ratio_${Date.now()}`,
         label: `Custom ${prev.length + 1}`,
         numerator_channel: 1,
-        denominator_channel: 3
+        denominator_channel: Math.max(
+          2,
+          prev.reduce((maxChannel, ratio) => Math.max(maxChannel, ratio.numerator_channel, ratio.denominator_channel), 3)
+        )
       }
     ]);
   };
@@ -662,7 +657,8 @@ export default function LeftPanel() {
             ...patch,
             channel: entry.channel
           };
-        })
+        }),
+        prev.map((entry) => entry.channel)
       )
     );
   };
@@ -675,7 +671,7 @@ export default function LeftPanel() {
   const removeConfigRatio = (index: number) => removeRatioDraft(setRatioDrafts, index);
   const removeStudyRatio = (index: number) => removeRatioDraft(setStudyRatioDrafts, index);
   const resetConfigRatios = () => setRatioDrafts(DEFAULT_RATIO_DEFINITIONS);
-  const resetConfigChannels = () => setChannelDrafts(DEFAULT_CHANNEL_DEFINITIONS);
+  const resetConfigChannels = () => setChannelDrafts(buildDefaultChannelDefinitions(configChannels.map((channel) => channel.channel)));
   const resetStudyRatios = () => setStudyRatioDrafts(ratioDefinitions);
   const resetStudyChannels = () => setStudyChannelDrafts(normalizeChannelDefinitions(channelDefinitions));
   const handleStudyRatioSave = async () => {
@@ -691,7 +687,7 @@ export default function LeftPanel() {
     if (!study) return;
     try {
       const response = await updateChannelsMutation.mutateAsync(studyChannelDrafts);
-      const normalized = normalizeChannelDefinitions(response.channels);
+      const normalized = normalizeChannelDefinitions(response.channels, studyChannels.map((channel) => channel.channel));
       setChannelDefinitions(normalized);
       updateStudy({ channel_definitions: normalized });
     } catch (error) {
@@ -701,7 +697,7 @@ export default function LeftPanel() {
 
   const configChannelLabelMap = useMemo(
     () =>
-      normalizeChannelDefinitions(channelDrafts).reduce<Record<number, string>>((acc, definition) => {
+      normalizeChannelDefinitions(channelDrafts, channelDrafts.map((definition) => definition.channel)).reduce<Record<number, string>>((acc, definition) => {
         acc[definition.channel] = definition.label;
         return acc;
       }, {}),
@@ -709,7 +705,7 @@ export default function LeftPanel() {
   );
   const studyChannelLabelMap = useMemo(
     () =>
-      normalizeChannelDefinitions(studyChannelDrafts).reduce<Record<number, string>>((acc, definition) => {
+      normalizeChannelDefinitions(studyChannelDrafts, studyChannelDrafts.map((definition) => definition.channel)).reduce<Record<number, string>>((acc, definition) => {
         acc[definition.channel] = definition.label;
         return acc;
       }, {}),
@@ -717,12 +713,10 @@ export default function LeftPanel() {
   );
 
   useEffect(() => {
-    setChannelWindowDrafts(buildChannelWindowDrafts(previewChannelRanges as Record<ChannelKey, [number, number]>, thresholds));
+    setChannelWindowDrafts(buildChannelWindowDrafts(previewChannelRanges, thresholds));
   }, [
     previewChannelRanges,
-    thresholds.channel_1,
-    thresholds.channel_2,
-    thresholds.channel_3,
+    thresholds,
   ]);
 
   const buildSliderChannelWindowDraft = (
@@ -730,33 +724,38 @@ export default function LeftPanel() {
     value: number[],
     activeThumb: number
   ): ChannelWindowDraft => {
-    const draft = channelWindowDrafts[channel];
-    const [rangeMin, rangeMax] = previewChannelRanges[channel];
-    const currentMin = parseIntensityDraft(draft.min) ?? rangeMin;
-    const currentThreshold = parseIntensityDraft(draft.threshold) ?? thresholds[channel];
-    const currentMax = parseIntensityDraft(draft.max) ?? rangeMax;
+    const [rangeMin, rangeMax] = previewChannelRanges[channel] ?? [0, getChannelLimit(channel)];
+    const limit = getChannelLimit(channel);
+    const draft = channelWindowDrafts[channel] ?? {
+      min: String(rangeMin),
+      threshold: String(thresholds[channel] ?? 0),
+      max: String(rangeMax)
+    };
+    const currentMin = Math.min(parseIntensityDraft(draft.min) ?? rangeMin, limit);
+    const currentThreshold = Math.min(parseIntensityDraft(draft.threshold) ?? thresholds[channel] ?? 0, limit);
+    const currentMax = Math.min(parseIntensityDraft(draft.max) ?? rangeMax, limit);
 
     if (activeThumb === 0) {
       return {
-        min: String(clampIntensity(Math.min(value[0], currentThreshold))),
-        threshold: String(clampIntensity(currentThreshold)),
-        max: String(clampIntensity(currentMax)),
+        min: String(clampIntensity(Math.min(value[0], currentThreshold), limit)),
+        threshold: String(clampIntensity(currentThreshold, limit)),
+        max: String(clampIntensity(currentMax, limit)),
       };
     }
 
     if (activeThumb === 2) {
       return {
-        min: String(clampIntensity(currentMin)),
-        threshold: String(clampIntensity(currentThreshold)),
-        max: String(clampIntensity(Math.max(value[2], currentThreshold))),
+        min: String(clampIntensity(currentMin, limit)),
+        threshold: String(clampIntensity(currentThreshold, limit)),
+        max: String(clampIntensity(Math.max(value[2], currentThreshold), limit)),
       };
     }
 
-    const nextThreshold = clampIntensity(value[1]);
+    const nextThreshold = clampIntensity(value[1], limit);
     return {
-      min: String(clampIntensity(Math.min(currentMin, nextThreshold))),
+      min: String(clampIntensity(Math.min(currentMin, nextThreshold), limit)),
       threshold: String(nextThreshold),
-      max: String(clampIntensity(Math.max(currentMax, nextThreshold))),
+      max: String(clampIntensity(Math.max(currentMax, nextThreshold), limit)),
     };
   };
 
@@ -765,20 +764,25 @@ export default function LeftPanel() {
     _source: ChannelWindowCommitSource,
     overrideDraft?: ChannelWindowDraft
   ) => {
-    const [currentMin, currentMax] = previewChannelRanges[channel];
-    const draft = overrideDraft ?? channelWindowDrafts[channel];
-    const minCandidate = parseIntensityDraft(draft.min) ?? currentMin;
-    const thresholdCandidate = parseIntensityDraft(draft.threshold) ?? thresholds[channel];
-    const maxCandidate = parseIntensityDraft(draft.max) ?? currentMax;
+    const [currentMin, currentMax] = previewChannelRanges[channel] ?? [0, getChannelLimit(channel)];
+    const draft = overrideDraft ?? channelWindowDrafts[channel] ?? {
+      min: String(currentMin),
+      threshold: String(thresholds[channel] ?? 0),
+      max: String(currentMax)
+    };
+    const limit = getChannelLimit(channel);
+    const minCandidate = Math.min(parseIntensityDraft(draft.min) ?? currentMin, limit);
+    const thresholdCandidate = Math.min(parseIntensityDraft(draft.threshold) ?? thresholds[channel] ?? 0, limit);
+    const maxCandidate = Math.min(parseIntensityDraft(draft.max) ?? currentMax, limit);
 
     // Histogram/statistics should follow threshold only; Min/Max are display bounds.
     const resolvedThreshold = thresholdCandidate;
     const resolvedMin = Math.min(minCandidate, thresholdCandidate);
     const resolvedMax = Math.max(maxCandidate, thresholdCandidate);
 
-    const normalizedMin = clampIntensity(resolvedMin);
-    const normalizedThreshold = clampIntensity(resolvedThreshold);
-    const normalizedMax = clampIntensity(resolvedMax);
+    const normalizedMin = clampIntensity(resolvedMin, limit);
+    const normalizedThreshold = clampIntensity(resolvedThreshold, limit);
+    const normalizedMax = clampIntensity(resolvedMax, limit);
 
     if (currentMin !== normalizedMin || currentMax !== normalizedMax) {
       setPreviewChannelRange(channel, [normalizedMin, normalizedMax]);
@@ -800,7 +804,11 @@ export default function LeftPanel() {
     setChannelWindowDrafts((previous) => ({
       ...previous,
       [channel]: {
-        ...previous[channel],
+        ...(previous[channel] ?? {
+          min: String(previewChannelRanges[channel]?.[0] ?? 0),
+          threshold: String(thresholds[channel] ?? 0),
+          max: String(previewChannelRanges[channel]?.[1] ?? getChannelLimit(channel))
+        }),
         [field]: value,
       },
     }));
@@ -821,9 +829,9 @@ export default function LeftPanel() {
       setChannelWindowDrafts((previous) => ({
         ...previous,
         [channel]: {
-          min: String(previewChannelRanges[channel][0]),
-          threshold: String(thresholds[channel]),
-          max: String(previewChannelRanges[channel][1]),
+          min: String(previewChannelRanges[channel]?.[0] ?? 0),
+          threshold: String(thresholds[channel] ?? 0),
+          max: String(previewChannelRanges[channel]?.[1] ?? 0),
         },
       }));
       event.currentTarget.blur();
@@ -835,9 +843,18 @@ export default function LeftPanel() {
   };
 
   const availableGroupNames = useMemo(() => Object.keys(groupMap).sort(), [groupMap]);
-  const configChannels = useMemo(() => normalizeChannelDefinitions(channelDrafts), [channelDrafts]);
-  const studyChannels = useMemo(() => normalizeChannelDefinitions(studyChannelDrafts), [studyChannelDrafts]);
-  const activeStudyChannels = useMemo(() => normalizeChannelDefinitions(channelDefinitions), [channelDefinitions]);
+  const configChannels = useMemo(
+    () => normalizeChannelDefinitions(channelDrafts, channelDrafts.map((definition) => definition.channel)),
+    [channelDrafts]
+  );
+  const studyChannels = useMemo(
+    () => normalizeChannelDefinitions(studyChannelDrafts, studyChannelDrafts.map((definition) => definition.channel)),
+    [studyChannelDrafts]
+  );
+  const activeStudyChannels = useMemo(
+    () => normalizeChannelDefinitions(channelDefinitions, channelDefinitions.map((definition) => definition.channel)),
+    [channelDefinitions]
+  );
   const hasGroups = availableGroupNames.length > 0;
   const builderSummary = useMemo(() => {
     const subjectCount = Object.values(groupMap).reduce((acc, subjects) => acc + subjects.length, 0);
@@ -1096,6 +1113,12 @@ export default function LeftPanel() {
                   const normalized = normalizeGroupMapping(groups);
                   setGroupMap(normalized);
                   setGroupsJson(JSON.stringify(normalized, null, 2));
+                  setChannelDrafts(
+                    normalizeChannelDefinitions(
+                      response.channel_definitions,
+                      response.channel_definitions?.map((definition) => definition.channel)
+                    )
+                  );
                   setConfigError(null);
                   setPixelSize("");
                 } catch (error) {
@@ -1575,9 +1598,9 @@ export default function LeftPanel() {
                           handleConfigRatioChange(index, { numerator_channel: Number(event.target.value) })
                         }
                       >
-                        {[1, 2, 3].map((channel) => (
-                          <MenuItem key={`config-ratio-num-${index}-${channel}`} value={channel}>
-                            {configChannelLabelMap[channel] ?? `Channel ${channel}`}
+                        {configChannels.map((channelDefinition) => (
+                          <MenuItem key={`config-ratio-num-${index}-${channelDefinition.channel}`} value={channelDefinition.channel}>
+                            {configChannelLabelMap[channelDefinition.channel] ?? `Channel ${channelDefinition.channel}`}
                           </MenuItem>
                         ))}
                       </TextField>
@@ -1591,9 +1614,9 @@ export default function LeftPanel() {
                           handleConfigRatioChange(index, { denominator_channel: Number(event.target.value) })
                         }
                       >
-                        {[1, 2, 3].map((channel) => (
-                          <MenuItem key={`config-ratio-den-${index}-${channel}`} value={channel}>
-                            {configChannelLabelMap[channel] ?? `Channel ${channel}`}
+                        {configChannels.map((channelDefinition) => (
+                          <MenuItem key={`config-ratio-den-${index}-${channelDefinition.channel}`} value={channelDefinition.channel}>
+                            {configChannelLabelMap[channelDefinition.channel] ?? `Channel ${channelDefinition.channel}`}
                           </MenuItem>
                         ))}
                       </TextField>
@@ -1671,15 +1694,24 @@ export default function LeftPanel() {
         <Typography variant="caption" color="text.secondary">
           Threshold only controls the mask; Min/Max control the raw intensity window for live previews. Overlay combines both.
         </Typography>
-        {channelKeys.map((channel, index) => {
-          const range = previewChannelRanges[channel];
-          const thresholdValue = Math.min(Math.max(thresholds[channel], range[0]), range[1]);
-          const definition = activeStudyChannels[index] ?? DEFAULT_CHANNEL_DEFINITIONS[index];
-          const draft = channelWindowDrafts[channel];
+        {activeStudyChannels.map((definition) => {
+          const channel = `channel_${definition.channel}`;
+          const limit = getChannelLimit(channel);
+          const range = previewChannelRanges[channel] ?? [0, limit];
+          const thresholdValue = Math.min(Math.max(thresholds[channel] ?? 0, range[0]), range[1]);
+          const draft = channelWindowDrafts[channel] ?? {
+            min: String(range[0]),
+            threshold: String(thresholdValue),
+            max: String(range[1])
+          };
           const sliderValue = sliderValueFromDraft(range, thresholdValue, draft);
           const displayMin = draft.min.trim() || String(range[0]);
           const displayThreshold = draft.threshold.trim() || String(thresholdValue);
           const displayMax = draft.max.trim() || String(range[1]);
+          const channelSliderMarks = [0, 0.25, 0.5, 0.75, 1].map((fraction, index) => ({
+            value: Math.round(limit * fraction),
+            label: index === 0 || index === 4 ? String(Math.round(limit * fraction)) : ""
+          }));
           return (
             <Box key={channel}>
               <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
@@ -1704,8 +1736,8 @@ export default function LeftPanel() {
               <Slider
                 size="small"
                 min={0}
-                max={4095}
-                marks={sliderMarks}
+                max={limit}
+                marks={channelSliderMarks}
                 disableSwap
                 onMouseEnter={() => setThresholdControlHovered(true)}
                 onMouseLeave={() => setThresholdControlHovered(false)}
@@ -1768,7 +1800,7 @@ export default function LeftPanel() {
                   type="number"
                   label="Min"
                   value={draft.min}
-                  inputProps={{ min: 0, max: 4095 }}
+                  inputProps={{ min: 0, max: limit }}
                   onChange={(event) => handleChannelWindowDraftChange(channel, "min", event.target.value)}
                   onBlur={() => commitChannelWindow(channel, "min")}
                   onKeyDown={(event) => handleChannelWindowKeyDown(event, channel, "min")}
@@ -1778,7 +1810,7 @@ export default function LeftPanel() {
                   type="number"
                   label="Threshold"
                   value={draft.threshold}
-                  inputProps={{ min: 0, max: 4095 }}
+                  inputProps={{ min: 0, max: limit }}
                   onChange={(event) => handleChannelWindowDraftChange(channel, "threshold", event.target.value)}
                   onBlur={() => commitChannelWindow(channel, "threshold")}
                   onKeyDown={(event) => handleChannelWindowKeyDown(event, channel, "threshold")}
@@ -1788,7 +1820,7 @@ export default function LeftPanel() {
                   type="number"
                   label="Max"
                   value={draft.max}
-                  inputProps={{ min: 1, max: 4095 }}
+                  inputProps={{ min: 1, max: limit }}
                   onChange={(event) => handleChannelWindowDraftChange(channel, "max", event.target.value)}
                   onBlur={() => commitChannelWindow(channel, "max")}
                   onKeyDown={(event) => handleChannelWindowKeyDown(event, channel, "max")}
@@ -2138,7 +2170,12 @@ export default function LeftPanel() {
                 } else {
                   setRatioDrafts(DEFAULT_RATIO_DEFINITIONS);
                 }
-                setChannelDrafts(normalizeChannelDefinitions(response.channel_definitions));
+                setChannelDrafts(
+                  normalizeChannelDefinitions(
+                    response.channel_definitions,
+                    response.channel_definitions?.map((definition) => definition.channel)
+                  )
+                );
                 setConfigError(null);
               } catch (error) {
                 setConfigError(getErrorMessage(error));
@@ -2408,11 +2445,11 @@ export default function LeftPanel() {
                     value={ratio.numerator_channel}
                     onChange={(event) => handleStudyRatioChange(index, { numerator_channel: Number(event.target.value) })}
                   >
-                    {[1, 2, 3].map((channel) => (
-                      <MenuItem key={`study-ratio-num-${index}-${channel}`} value={channel}>
-                        {studyChannelLabelMap[channel] ?? `Channel ${channel}`}
-                      </MenuItem>
-                    ))}
+                  {studyChannels.map((channelDefinition) => (
+                    <MenuItem key={`study-ratio-num-${index}-${channelDefinition.channel}`} value={channelDefinition.channel}>
+                      {studyChannelLabelMap[channelDefinition.channel] ?? `Channel ${channelDefinition.channel}`}
+                    </MenuItem>
+                  ))}
                   </TextField>
                   <TextField
                     label="Denominator"
@@ -2425,11 +2462,11 @@ export default function LeftPanel() {
                       handleStudyRatioChange(index, { denominator_channel: Number(event.target.value) })
                     }
                   >
-                    {[1, 2, 3].map((channel) => (
-                      <MenuItem key={`study-ratio-den-${index}-${channel}`} value={channel}>
-                        {studyChannelLabelMap[channel] ?? `Channel ${channel}`}
-                      </MenuItem>
-                    ))}
+                  {studyChannels.map((channelDefinition) => (
+                    <MenuItem key={`study-ratio-den-${index}-${channelDefinition.channel}`} value={channelDefinition.channel}>
+                      {studyChannelLabelMap[channelDefinition.channel] ?? `Channel ${channelDefinition.channel}`}
+                    </MenuItem>
+                  ))}
                   </TextField>
                   <Button
                     variant="text"

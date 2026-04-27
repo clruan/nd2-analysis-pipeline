@@ -19,7 +19,11 @@ from ..logging_utils import log_event
 from ..schemas import LoadStudyRequest
 from ..state import STATE, PersistedStudyRecord, StudyRecord
 from ..utils import find_nd2_files, normalize_path, slugify
-from .channels import normalize_channel_definitions
+from .channels import (
+    channel_definitions_are_default,
+    detect_channel_definitions_from_dir,
+    normalize_channel_definitions,
+)
 from .ratios import normalize_ratio_definitions
 from .study_common import (
     LOGGER,
@@ -294,8 +298,15 @@ def _materialize_study_record(
             if ratio_definitions is None:
                 ratio_definitions = None
 
+    result_channel_ids = results.channel_ids
+
+    if input_dir and (channel_definitions is None or channel_definitions_are_default(channel_definitions, channel_ids=result_channel_ids)):
+        detected_channels = detect_channel_definitions_from_dir(input_dir)
+        if detected_channels:
+            channel_definitions = detected_channels
+
     ratio_definitions = normalize_ratio_definitions(ratio_definitions)
-    channel_definitions = normalize_channel_definitions(channel_definitions)
+    channel_definitions = normalize_channel_definitions(channel_definitions, channel_ids=result_channel_ids)
     if pixel_size_um is None and input_dir:
         pixel_size_um = _detect_pixel_size_from_dir(input_dir)
     replicate_lookup = _build_replicate_lookup(results, input_dir) if input_dir else {}

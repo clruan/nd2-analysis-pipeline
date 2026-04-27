@@ -178,6 +178,39 @@ def test_launch_threshold_run_rejects_missing_non_nd2_reader_dependency(tmp_path
     assert ".oib" in exc_info.value.detail
 
 
+def test_launch_threshold_run_uses_detected_channel_metadata_when_config_has_no_labels(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _configure_state(tmp_path)
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    nd2_path = input_dir / "sample.nd2"
+    nd2_path.write_bytes(b"nd2")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"groups": {"Control": ["A1"]}}), encoding="utf-8")
+
+    detected_channels = [
+        {"channel": 1, "label": "DAPI", "color": "#0000ff"},
+        {"channel": 2, "label": "VCAM", "color": "#00ff00"},
+        {"channel": 3, "label": "FActin", "color": "#ff0000"},
+    ]
+
+    monkeypatch.setattr(threshold_runner, "_fingerprint_sources", lambda *_args: (1.0, "test-hash", []))
+    monkeypatch.setattr(threshold_runner, "find_nd2_files", lambda *_args: [nd2_path])
+    monkeypatch.setattr(threshold_runner, "detect_channel_definitions_from_dir", lambda _path: detected_channels)
+
+    status = threshold_runner.launch_threshold_run(
+        threshold_runner.ThresholdRunRequest(
+            input_dir=str(input_dir),
+            config_path=str(config_path),
+            reuse_existing=False,
+        )
+    )
+
+    persisted = STATE.get_run(status.job_id)
+    assert persisted.channel_definitions == detected_channels
+
+
 def test_worker_executes_queued_runs_and_persists_success(tmp_path: Path, monkeypatch) -> None:
     settings = _configure_state(tmp_path)
     input_dir = tmp_path / "input"

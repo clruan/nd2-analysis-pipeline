@@ -7,7 +7,7 @@ from pathlib import Path
 
 # Import from existing pipeline (no changes to existing code)
 from config import DEFAULT_MARKER, DEFAULT_MARKER_2D
-from image_processing import load_nd2_file, parse_mouse_id
+from image_processing import load_microscopy_channels, parse_mouse_id
 from data_models import GroupConfig
 from .data_models import ThresholdData
 
@@ -40,7 +40,7 @@ def analyze_single_image_all_thresholds(
     mouse_lookup: Dict,
     is_3d: bool = True,
     marker: str = None,
-    max_threshold: int = 4095
+    max_threshold: int = 0
 ) -> Optional[ThresholdData]:
     """
     Analyze a single image at all threshold values.
@@ -52,7 +52,7 @@ def analyze_single_image_all_thresholds(
         mouse_lookup: Dictionary mapping mouse IDs to groups
         is_3d: Whether file contains 3D data
         marker: Filename marker for mouse ID extraction
-        max_threshold: Maximum threshold value to test (default 4095)
+        max_threshold: Maximum threshold value to test. Use 0 to auto-size from the image data.
         
     Returns:
         ThresholdData object or None if error
@@ -71,19 +71,28 @@ def analyze_single_image_all_thresholds(
             
         group_name = mouse_lookup[mouse_id]["group"]
         
-        # Load image data using existing function
-        channel_1, channel_2, channel_3 = load_nd2_file(filepath, is_3d)
-        ch1_percentages = _compute_threshold_percentages(channel_1, max_threshold)
-        ch2_percentages = _compute_threshold_percentages(channel_2, max_threshold)
-        ch3_percentages = _compute_threshold_percentages(channel_3, max_threshold)
-        
+        channel_arrays = load_microscopy_channels(filepath, is_3d)
+        if not channel_arrays:
+            raise ValueError(f"No channels were loaded from {filepath}")
+
+        resolved_max_threshold = int(max_threshold)
+        if resolved_max_threshold <= 0:
+            channel_maxima = [
+                int(np.ceil(np.max(np.asarray(channel)))) if np.asarray(channel).size else 0
+                for channel in channel_arrays.values()
+            ]
+            resolved_max_threshold = max(channel_maxima, default=0)
+
+        channel_percentages = {
+            channel: _compute_threshold_percentages(channel_data, resolved_max_threshold)
+            for channel, channel_data in channel_arrays.items()
+        }
+
         return ThresholdData(
             mouse_id=mouse_id,
             group=group_name,
             filename=Path(filepath).name,
-            channel_1_percentages=ch1_percentages,
-            channel_2_percentages=ch2_percentages,
-            channel_3_percentages=ch3_percentages
+            channel_percentages=channel_percentages,
         )
         
     except Exception as e:
@@ -105,9 +114,8 @@ def test_single_file(filepath: str, config_path: str) -> bool:
             
         print(f"Success! Processed {result.filename}")
         print(f"Mouse: {result.mouse_id}, Group: {result.group}")
-        print(f"Channel 1 at threshold 1000: {result.get_percentage_at_threshold(1, 1000):.2f}%")
-        print(f"Channel 2 at threshold 1000: {result.get_percentage_at_threshold(2, 1000):.2f}%")
-        print(f"Channel 3 at threshold 1000: {result.get_percentage_at_threshold(3, 1000):.2f}%")
+        for channel in result.channel_ids:
+            print(f"Channel {channel} at threshold 1000: {result.get_percentage_at_threshold(channel, 1000):.2f}%")
         
         return True
         

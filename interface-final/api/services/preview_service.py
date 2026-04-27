@@ -44,15 +44,17 @@ from .preview_rendering import (
 from .study_common import (
     LOGGER,
     PREVIEW_ROOT,
+    _analysis_cache_key,
     _discover_preview_plane_root,
     _get_record,
     _metric_definitions,
     _preview_root_has_npy_planes,
+    _record_channel_ids,
     _sanitize_panel_order,
     _threshold_dict,
 )
 from .study_loader import _record_has_preview_sources
-from image_processing import load_nd2_file
+from image_processing import load_microscopy_channels
 from visualization import ND2Visualizer
 
 
@@ -144,7 +146,8 @@ def _is_latest_preview_revision(study_id: str, revision_key: str) -> bool:
 
 def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse:
     record = _get_record(study_id)
-    thresholds = _threshold_dict(request.thresholds)
+    channel_ids = _record_channel_ids(record)
+    thresholds = _threshold_dict(request.thresholds, channel_ids=channel_ids)
     metric_defs = _metric_definitions(record)
     metric_map = {metric["id"]: metric for metric in metric_defs}
 
@@ -157,7 +160,7 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
         elif record.preview_plane_root is None:
             record.preview_plane_root = preview_dir
 
-    threshold_key = f"{thresholds['channel_1']}-{thresholds['channel_2']}-{thresholds['channel_3']}"
+    threshold_key = _analysis_cache_key(thresholds)
     threshold_dir = ensure_directory(preview_dir / threshold_key)
     _prune_preview_thresholds(preview_dir, retain_keys={threshold_key})
     available_metric_ids = [metric["id"] for metric in metric_defs]
@@ -169,7 +172,7 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
 
     groups_requested = set(request.groups) if request.groups else None
     channel_ranges = _normalize_channel_ranges(request.channel_ranges)
-    style_token = _preview_style_token(channel_ranges, record.channel_definitions)
+    style_token = _preview_style_token(channel_ranges, record.channel_definitions, channel_ids=channel_ids)
     revision_key = request.revision_key or f"{threshold_key}|{style_token}"
     _set_latest_preview_revision(study_id, revision_key)
     group_counts: Dict[str, int] = defaultdict(int)
@@ -350,10 +353,18 @@ def generate_previews(study_id: str, request: PreviewRequest) -> PreviewResponse
 
 def render_preview_panel(study_id: str, request: PreviewDownloadRequest) -> PreviewDownloadResponse:
     record = _get_record(study_id)
-    thresholds = _threshold_dict(request.thresholds)
-    panel_order = _sanitize_panel_order(request.panel_order)
+    channel_ids = _record_channel_ids(record)
+    thresholds = _threshold_dict(request.thresholds, channel_ids=channel_ids)
+    panel_order = _sanitize_panel_order(request.panel_order, channel_ids=channel_ids)
     channel_ranges = _normalize_channel_ranges(request.channel_ranges)
     visualizer_ranges = _visualizer_range_payload(channel_ranges)
+    composite_channels = sorted(
+        {
+            int(channel)
+            for channel in (request.composite_channels or channel_ids)
+            if int(channel) in set(channel_ids)
+        }
+    ) or list(channel_ids)
 
     channel_arrays = _load_channels(
         record,
@@ -373,10 +384,12 @@ def render_preview_panel(study_id: str, request: PreviewDownloadRequest) -> Prev
             return array
         return np.max(array, axis=0)
 
-    channel_1 = _project(1)
-    channel_2 = _project(2)
-    channel_3 = _project(3)
-    if channel_1 is None or channel_2 is None or channel_3 is None:
+    projected_channels = {
+        channel_id: projected
+        for channel_id in channel_ids
+        if (projected := _project(channel_id)) is not None
+    }
+    if not projected_channels:
         raise HTTPException(status_code=422, detail="One or more channels are missing for this preview.")
 
     panel_dir = ensure_directory(PREVIEW_ROOT / study_id / "custom_panels")
@@ -386,22 +399,25 @@ def render_preview_panel(study_id: str, request: PreviewDownloadRequest) -> Prev
 
     requested_scale_bar = request.scale_bar_um
     add_scale_bar = requested_scale_bar is None or requested_scale_bar > 0
-    vis_config = VisualizationConfig(scale_bar_um=requested_scale_bar or 50)
+    vis_config = VisualizationConfig(
+        scale_bar_um=requested_scale_bar or 50,
+        scale_bar_font_size=request.scale_bar_font_size,
+    )
     visualizer = ND2Visualizer(vis_config, pixel_size_um=record.pixel_size_um, channel_definitions=record.channel_definitions)
     figure = visualizer.visualize_channels(
-        channel_1,
-        channel_2,
-        channel_3,
+        projected_channels,
         save_path=str(target_path),
         add_scale_bar=add_scale_bar,
         panel_order=panel_order,
         channel_ranges=visualizer_ranges,
+        composite_channels=composite_channels,
     )
     plt.close(figure)
 
     return PreviewDownloadResponse(
         image_path=str(target_path),
         panel_order=panel_order,
+        composite_channels=composite_channels,
     )
 
 
@@ -435,6 +451,7 @@ def _load_channels(
             return record.raw_cache[cache_key]
 
     channel_arrays: Dict[int, np.ndarray] = {}
+    channel_ids = _record_channel_ids(record)
     if record.preview_plane_root is None or not _preview_root_has_npy_planes(record.preview_plane_root):
         discovered_root = _discover_preview_plane_root(record.study_id)
         if discovered_root is not None:
@@ -442,7 +459,7 @@ def _load_channels(
 
     if record.preview_plane_root:
         plane_dir = record.preview_plane_root / "planes"
-        for channel_index in (1, 2, 3):
+        for channel_index in channel_ids:
             plane_path = plane_dir / preview_plane_filename(group, subject_id, filename, channel_index)
             if not plane_path.exists():
                 channel_arrays.clear()
@@ -464,8 +481,7 @@ def _load_channels(
         subject_path = _resolve_source_image_path(record, subject_id, filename)
         if subject_path and subject_path.exists():
             try:
-                ch1, ch2, ch3 = load_nd2_file(str(subject_path), is_3d=record.is_3d)
-                channel_arrays = {1: ch1, 2: ch2, 3: ch3}
+                channel_arrays = load_microscopy_channels(str(subject_path), is_3d=record.is_3d)
                 _persist_preview_planes(record, group, subject_id, filename, channel_arrays)
                 source_tag = "nd2"
             except Exception:
@@ -508,7 +524,7 @@ def _load_channels_from_cached_png(record, group: str, subject_id: str, filename
     safe_base = f"{slugify(group)}_{slugify(subject_id)}_{slugify(filename)}"
     channel_arrays: Dict[int, np.ndarray] = {}
 
-    for channel_index in (1, 2, 3):
+    for channel_index in _record_channel_ids(record):
         image_name = f"{safe_base}_raw_ch{channel_index}.png"
         image_path = raw_dir / image_name
         if not image_path.exists():
@@ -517,7 +533,8 @@ def _load_channels_from_cached_png(record, group: str, subject_id: str, filename
             with Image.open(image_path) as image:
                 grayscale = image.convert("L")
                 array = np.asarray(grayscale, dtype=np.float32)
-                rescaled = (array / 255.0) * 4095.0
+                channel_limit = float(record.results.channel_limits.get(channel_index, record.results.max_threshold or 4095))
+                rescaled = (array / 255.0) * channel_limit
                 channel_arrays[channel_index] = rescaled.astype(np.uint16)
         except Exception:
             continue

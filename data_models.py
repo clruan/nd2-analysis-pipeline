@@ -166,6 +166,7 @@ class VisualizationConfig:
     scale_bar_um: float = 50
     scale_bar_color: str = 'white'
     scale_bar_thickness: int = 3
+    scale_bar_font_size: Optional[int] = None
     figure_size: tuple = (16, 4)
     dpi: int = 300
     colormap_1: str = 'Greens'

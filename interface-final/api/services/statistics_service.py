@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from ..schemas import StatisticsRequest, StatisticsResponse
 from .analysis_service import _analysis_tables_for_thresholds
-from .study_common import _analysis_cache_key, _get_record, _threshold_dict
+from .study_common import _analysis_cache_key, _get_record, _record_channel_ids, _threshold_dict
 
 
 def _statistics_cache_key(thresholds: Dict[str, int], request: StatisticsRequest) -> str:
@@ -27,7 +27,7 @@ def _statistics_cache_key(thresholds: Dict[str, int], request: StatisticsRequest
 
 def perform_statistics(study_id: str, request: StatisticsRequest) -> StatisticsResponse:
     record = _get_record(study_id)
-    thresholds = _threshold_dict(request.thresholds)
+    thresholds = _threshold_dict(request.thresholds, channel_ids=_record_channel_ids(record))
     cache_key = _statistics_cache_key(thresholds, request)
     cached = record.statistics_cache.get(cache_key)
     if isinstance(cached, StatisticsResponse):
@@ -35,17 +35,14 @@ def perform_statistics(study_id: str, request: StatisticsRequest) -> StatisticsR
     uses_ratio_metrics = True
     mouse_averages_df, _ = _analysis_tables_for_thresholds(record, thresholds)
 
-    channels = [
-        ("channel_1", "Channel_1_area"),
-        ("channel_2", "Channel_2_area"),
-        ("channel_3", "Channel_3_area"),
-    ]
-
     statistics = {}
-    for channel_key, column in channels:
+    for channel in _record_channel_ids(record):
+        channel_key = f"channel_{channel}_area"
+        column = f"Channel_{channel}_area"
         groups_data = {
             group: group_df[column].dropna().tolist()
             for group, group_df in mouse_averages_df.groupby("Group")
+            if column in group_df
         }
 
         statistics[channel_key] = _analyze_groups(

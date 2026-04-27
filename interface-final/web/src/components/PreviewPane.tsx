@@ -10,6 +10,7 @@ import {
   Collapse,
   IconButton,
   Stack,
+  TextField,
   Tooltip,
   Typography
 } from "@mui/material";
@@ -25,7 +26,7 @@ import KeyboardArrowUpIcon from "@mui/icons-material/KeyboardArrowUp";
 import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
-import { CHANNEL_METRICS, normalizeChannelDefinitions } from "../constants/metrics";
+import { buildChannelMetrics, normalizeChannelDefinitions } from "../constants/metrics";
 
 type Variant = PreviewImage["variant"];
 
@@ -68,8 +69,15 @@ export default function PreviewPane() {
     previewPanelOrder,
     setPreviewPanelOrder,
     resetPreviewPanelOrder,
+    previewCompositeChannels,
+    setPreviewCompositeChannels,
+    resetPreviewCompositeChannels,
     previewScaleBarEnabled,
-    setPreviewScaleBarEnabled
+    setPreviewScaleBarEnabled,
+    previewScaleBarLengthUm,
+    setPreviewScaleBarLengthUm,
+    previewScaleBarFontSize,
+    setPreviewScaleBarFontSize
   } = useAppStore();
   const normalizedChannels = useMemo(() => normalizeChannelDefinitions(channelDefinitions), [channelDefinitions]);
   const channelById = useMemo(
@@ -82,7 +90,7 @@ export default function PreviewPane() {
   );
   const { debounced } = useThresholds();
   const metricsCatalog = useMemo(() => {
-    const base = CHANNEL_METRICS.map((metric) => ({
+    const base = buildChannelMetrics(normalizedChannels).map((metric) => ({
       id: metric.id,
       title: `${channelById[metric.channel]?.label ?? `Channel ${metric.channel}`} Area (%)`
     }));
@@ -113,7 +121,19 @@ export default function PreviewPane() {
     () => normalizedChannels.map((channel) => `${channel.channel}:${channel.color}`).join("|"),
     [normalizedChannels]
   );
-  const previewRevisionKey = `${debounced.channel_1}-${debounced.channel_2}-${debounced.channel_3}|${rangeSignature}|${channelSignature}`;
+  const thresholdSignature = useMemo(
+    () =>
+      Object.entries(debounced)
+        .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }))
+        .map(([key, value]) => `${key}:${value}`)
+        .join("|"),
+    [debounced]
+  );
+  const compositeSignature = useMemo(
+    () => previewCompositeChannels.slice().sort((a, b) => a - b).join(","),
+    [previewCompositeChannels]
+  );
+  const previewRevisionKey = `${thresholdSignature}|${rangeSignature}|${channelSignature}|cmp:${compositeSignature}`;
   const focusedGroupLimits = useMemo(() => {
     if (prioritySubjects.length === 0) {
       return undefined;
@@ -166,7 +186,7 @@ export default function PreviewPane() {
       void fullPreviewQuery.refetch();
     }
   };
-  const thresholdKey = `${debounced.channel_1}-${debounced.channel_2}-${debounced.channel_3}`;
+  const thresholdKey = thresholdSignature.replace(/[|:]/g, "_");
   const handleRefreshPreviews = () => {
     if (!study) return;
     refreshMutation.mutate(
@@ -402,13 +422,20 @@ export default function PreviewPane() {
       return { ...previous, [key]: true };
     });
   };
-  const panelOptions = [
-    { id: "channel_1", label: channelById[1]?.label ?? "Channel 1" },
-    { id: "channel_2", label: channelById[2]?.label ?? "Channel 2" },
-    { id: "channel_3", label: channelById[3]?.label ?? "Channel 3" },
-    { id: "composite", label: "Composite RGB" }
-  ] as const;
-  type PanelOptionId = (typeof panelOptions)[number]["id"];
+  const panelOptions = useMemo(
+    () => [
+      ...normalizedChannels.map((channel) => ({
+        id: `channel_${channel.channel}`,
+        label: channel.label
+      })),
+      {
+        id: "composite",
+        label: `Composite ${previewCompositeChannels.join(",") || "All"}`
+      }
+    ],
+    [normalizedChannels, previewCompositeChannels]
+  );
+  type PanelOptionId = string;
 
   const handleTogglePanel = (panelId: PanelOptionId, enabled: boolean) => {
     if (enabled) {
@@ -446,8 +473,10 @@ export default function PreviewPane() {
         filename: column.filename,
         thresholds: debounced,
         panel_order: previewPanelOrder,
+        composite_channels: previewCompositeChannels,
         channel_ranges: channelRangesPayload,
-        scale_bar_um: previewScaleBarEnabled ? undefined : 0
+        scale_bar_um: previewScaleBarEnabled ? previewScaleBarLengthUm : 0,
+        scale_bar_font_size: previewScaleBarEnabled ? previewScaleBarFontSize : undefined
       },
       {
         onSuccess: (response) => {
@@ -611,6 +640,35 @@ export default function PreviewPane() {
               <Button variant="text" size="small" onClick={resetPreviewPanelOrder}>
                 Reset order
               </Button>
+              <Stack spacing={0.5} pt={0.5}>
+                <Typography variant="caption" color="text.secondary">
+                  Composite channels
+                </Typography>
+                <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                  {normalizedChannels.map((channel) => {
+                    const selected = previewCompositeChannels.includes(channel.channel);
+                    return (
+                      <Chip
+                        key={`preview-composite-${channel.channel}`}
+                        size="small"
+                        clickable
+                        label={channel.label}
+                        color={selected ? "primary" : "default"}
+                        variant={selected ? "filled" : "outlined"}
+                        onClick={() => {
+                          const next = selected
+                            ? previewCompositeChannels.filter((value) => value !== channel.channel)
+                            : [...previewCompositeChannels, channel.channel];
+                          setPreviewCompositeChannels(next);
+                        }}
+                      />
+                    );
+                  })}
+                </Stack>
+                <Button variant="text" size="small" onClick={resetPreviewCompositeChannels}>
+                  Reset composite
+                </Button>
+              </Stack>
             </Stack>
             <FormControlLabel
               control={
@@ -622,10 +680,48 @@ export default function PreviewPane() {
               }
               label={
                 <Typography variant="caption" color="text.secondary">
-                  Include scale bar in downloads (last panel/composite)
+                  Include scale bar in downloaded panels
                 </Typography>
               }
             />
+            {previewScaleBarEnabled && (
+              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ pl: 4, pt: 0.5 }}>
+                <TextField
+                  size="small"
+                  label="Bar (µm)"
+                  type="number"
+                  value={previewScaleBarLengthUm}
+                  onChange={(event) => {
+                    if (event.target.value === "") {
+                      return;
+                    }
+                    const numeric = Number(event.target.value);
+                    if (Number.isFinite(numeric)) {
+                      setPreviewScaleBarLengthUm(numeric);
+                    }
+                  }}
+                  inputProps={{ min: 5, max: 500, step: 5 }}
+                  sx={{ maxWidth: 132 }}
+                />
+                <TextField
+                  size="small"
+                  label="Font (px)"
+                  type="number"
+                  value={previewScaleBarFontSize}
+                  onChange={(event) => {
+                    if (event.target.value === "") {
+                      return;
+                    }
+                    const numeric = Number(event.target.value);
+                    if (Number.isFinite(numeric)) {
+                      setPreviewScaleBarFontSize(numeric);
+                    }
+                  }}
+                  inputProps={{ min: 6, max: 32, step: 1 }}
+                  sx={{ maxWidth: 132 }}
+                />
+              </Stack>
+            )}
           </Collapse>
         </Box>
         <Stack direction="row" spacing={1} alignItems="center">

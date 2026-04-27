@@ -21,21 +21,45 @@ These pillars align with the types of arguments IEEE VIS/CHI favor: problem fram
 ## Quick start
 
 ```bash
-# Backend environment
-python3 -m venv interface-final/api/venv
-source interface-final/api/venv/bin/activate
-pip install -r interface-final/api/requirements.txt
-# run from the repository root
-# Launch from the repository root so the interface package resolves correctly
-uvicorn --app-dir interface-final api.main:app --reload --port 8100
+# Run from the repository root
+chmod +x interface-final/start.sh
+./interface-final/start.sh
+```
 
-# Frontend environment
+Open the frontend at http://127.0.0.1:5173/.
+The script starts both services together:
+- API: `http://127.0.0.1:8100`
+- Web UI: `http://127.0.0.1:5173`
+
+The launcher prefers `python3.12` or `python3.11` for the backend because
+the microscopy reader stack used for `.czi`/`.oib`/`.oif` files does not
+install cleanly on Python 3.13.
+
+Stop both with `Ctrl+C` in the same terminal.
+
+### Run a second isolated instance
+
+Launch another copy on different ports (for a separate project) so state does not mix:
+
+```bash
+API_PORT=8200 WEB_PORT=5174 ./interface-final/start.sh
+```
+
+Then open `http://127.0.0.1:5174`. This frontend instance proxies to `http://127.0.0.1:8200`.
+
+### Manual start (fallback)
+
+```bash
+# Backend
+python3.12 -m venv interface-final/api/venv-py3.12
+source interface-final/api/venv-py3.12/bin/activate
+pip install -r interface-final/api/requirements.txt
+uvicorn --app-dir interface-final api.main:app --port 8100
+
+# Frontend (new terminal)
 npm --prefix interface-final/web install
 npm --prefix interface-final/web run dev
 ```
-
-Open the frontend at http://localhost:5173/ and point it at the running API
-(`http://localhost:8100`).
 
 ## Workflow
 
@@ -59,6 +83,8 @@ Open the frontend at http://localhost:5173/ and point it at the running API
 - **Preview refresh & flush controls** – refresh the active threshold folder or wipe the entire cache without leaving the browser; both operations automatically retrigger the preview API so you see the regenerated PNGs.
 - **Per-group preview overrides** – keep a global subject cap while optionally pinning individual groups to show more (or fewer) mice directly from the preview pane.
 - **Custom ratio editor** – define arbitrary channel ratios when creating configs or after loading a study; the new metrics cascade through charts, stats, downloads, and previews automatically.
+- **Subject strategy toggle** – scan in `per_file` mode (default, each file stays independent) or `auto` mode (infer shared subject IDs from filename tokens) depending on whether datasets are replicate-heavy or subject-encoded.
+- **Channel naming + pseudocolor controls** – configure channel labels/colors while building a config and update them again after loading a study; labels propagate to thresholds/charts/exports and pseudocolors drive preview/composite rendering.
 - **One-click exports** – every preview tile now includes a download icon, and each Plotly-based analysis card exposes an `Export PNG` button that invokes `Plotly.downloadImage` with consistent sizing.
 
 ### Study Workflow (Detailed)

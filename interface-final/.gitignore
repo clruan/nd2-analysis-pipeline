@@ -5,6 +5,7 @@ api/.mypy_cache/
 api/services/__pycache__/
 api/services/generated_configs/
 api/services/generated_downloads/
+api/services/generated_inputs/
 api/services/generated_previews/
 api/services/generated_results/
 api/services/uploaded_inputs/

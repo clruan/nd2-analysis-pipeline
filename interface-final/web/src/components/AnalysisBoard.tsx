@@ -8,7 +8,7 @@ import { useAppStore } from "../state/useAppStore";
 import { useThresholds } from "../hooks/useThresholds";
 import { thresholdsEqual, useThresholdMotion } from "../hooks/useThresholdMotion";
 import type { IndividualImageRecord, MouseAverageRecord, StatisticsResponse } from "../api/types";
-import { CHANNEL_METRICS, normalizeChannelDefinitions } from "../constants/metrics";
+import { buildChannelMetrics, normalizeChannelDefinitions } from "../constants/metrics";
 import DownloadIcon from "@mui/icons-material/FileDownloadOutlined";
 
 type MetricDescriptor = {
@@ -325,22 +325,14 @@ export default function AnalysisBoard() {
   );
 
   const metrics = useMemo<MetricDescriptor[]>(() => {
-    const base = CHANNEL_METRICS.map((metric) => {
-      const mouseKey = `Channel_${metric.channel}_area` as keyof MouseAverageRecord;
-      const replicateKey = `channel_${metric.channel}_area` as keyof IndividualImageRecord;
+    const base = buildChannelMetrics(normalizedChannels).map((metric) => {
       const channelLabel = channelLabelMap[metric.channel] ?? `Channel ${metric.channel}`;
       return {
         id: metric.id,
         label: `${channelLabel} Positive Signal (%)`,
-        statsKey: `channel_${metric.channel}`,
-        valueAccessor: (record: MouseAverageRecord) => {
-          const raw = record[mouseKey];
-          return typeof raw === "number" ? raw : null;
-        },
-        replicateAccessor: (record: IndividualImageRecord) => {
-          const raw = record[replicateKey];
-          return typeof raw === "number" ? raw : null;
-        }
+        statsKey: metric.id,
+        valueAccessor: (record: MouseAverageRecord) => record.channel_areas?.[metric.id] ?? null,
+        replicateAccessor: (record: IndividualImageRecord) => record.channel_areas?.[metric.id] ?? null
       };
     });
     const ratioMetrics = ratioDefinitions.map((ratio) => ({
@@ -571,6 +563,11 @@ export default function AnalysisBoard() {
       plotRefs.current[metricId] = graphDiv;
     };
 
+  const thresholdToken = Object.entries(thresholds)
+    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }))
+    .map(([key, value]) => `${key}-${value}`)
+    .join("_");
+
   const handleExportFigure = async (metricId: string) => {
     const graphDiv = plotRefs.current[metricId];
     if (!graphDiv) {
@@ -583,7 +580,7 @@ export default function AnalysisBoard() {
       const filenameParts = [
         (study.study_name || "microscopy-study").replace(/\s+/g, "_"),
         metricId,
-        `${thresholds.channel_1}-${thresholds.channel_2}-${thresholds.channel_3}`
+        thresholdToken
       ];
       const downloadOptions = {
         format: "png",
@@ -609,7 +606,9 @@ export default function AnalysisBoard() {
             {study.study_name}
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            {groupNames.length} groups • thresholds: {(channelLabelMap[1] ?? "Ch1")} {thresholds.channel_1} | {(channelLabelMap[2] ?? "Ch2")} {thresholds.channel_2} | {(channelLabelMap[3] ?? "Ch3")} {thresholds.channel_3}
+            {groupNames.length} groups • thresholds: {normalizedChannels
+              .map((channel) => `${channel.label} ${thresholds[`channel_${channel.channel}`] ?? 0}`)
+              .join(" | ")}
           </Typography>
           {isUpdatingMetrics && (
             <Typography variant="caption" color="text.secondary" display="block">

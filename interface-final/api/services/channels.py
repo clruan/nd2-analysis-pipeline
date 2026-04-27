@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-VALID_CHANNELS = (1, 2, 3)
+from image_processing import detect_channel_definitions as detect_channel_definitions_from_file
 
-DEFAULT_CHANNEL_DEFINITIONS: List[Dict[str, object]] = [
-    {"channel": 1, "label": "Channel 1", "color": "#00ff00"},
-    {"channel": 2, "label": "Channel 2", "color": "#ff0000"},
-    {"channel": 3, "label": "Channel 3", "color": "#0000ff"},
-]
+from ..utils import find_nd2_files
+
+DEFAULT_CHANNEL_COLORS: Tuple[str, ...] = (
+    "#00ff00",
+    "#ff0000",
+    "#0000ff",
+    "#ffff00",
+    "#00ffff",
+    "#ff00ff",
+    "#ffffff",
+    "#ff8800",
+)
 
 NAMED_COLORS: Dict[str, str] = {
     "red": "#ff0000",
@@ -29,18 +37,57 @@ NAMED_COLORS: Dict[str, str] = {
 HEX_COLOR_PATTERN = re.compile(r"^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
 
-def normalize_channel_definitions(channels: Iterable[Dict[str, Any]] | None) -> List[Dict[str, object]]:
-    """Validate and standardize channel definitions, falling back to defaults."""
-    normalized = {entry["channel"]: dict(entry) for entry in DEFAULT_CHANNEL_DEFINITIONS}
-    if not channels:
-        return [normalized[channel] for channel in VALID_CHANNELS]
+def _default_channel_color(channel: int) -> str:
+    if 1 <= channel <= len(DEFAULT_CHANNEL_COLORS):
+        return DEFAULT_CHANNEL_COLORS[channel - 1]
+    return DEFAULT_CHANNEL_COLORS[(channel - 1) % len(DEFAULT_CHANNEL_COLORS)]
 
-    for entry in channels:
+
+def default_channel_definitions(channel_ids: Optional[Iterable[int]] = None) -> List[Dict[str, object]]:
+    normalized_ids = sorted({int(channel) for channel in (channel_ids or [1, 2, 3]) if int(channel) > 0})
+    if not normalized_ids:
+        normalized_ids = [1, 2, 3]
+    return [
+        {"channel": channel, "label": f"Channel {channel}", "color": _default_channel_color(channel)}
+        for channel in normalized_ids
+    ]
+
+
+DEFAULT_CHANNEL_DEFINITIONS: List[Dict[str, object]] = default_channel_definitions()
+
+
+def normalize_channel_definitions(
+    channels: Iterable[Dict[str, Any]] | None,
+    channel_ids: Optional[Iterable[int]] = None,
+) -> List[Dict[str, object]]:
+    """Validate and standardize channel definitions, falling back to defaults."""
+    target_ids = sorted(
+        {
+            int(channel)
+            for channel in (channel_ids or [])
+            if channel is not None and int(channel) > 0
+        }
+    )
+
+    provided_ids: List[int] = []
+    for entry in channels or []:
         try:
             channel = int(entry.get("channel"))
         except (TypeError, ValueError, AttributeError):
             continue
-        if channel not in VALID_CHANNELS:
+        if channel > 0:
+            provided_ids.append(channel)
+
+    if not target_ids:
+        target_ids = sorted(set(provided_ids)) or [1, 2, 3]
+
+    normalized = {entry["channel"]: dict(entry) for entry in default_channel_definitions(target_ids)}
+    for entry in channels or []:
+        try:
+            channel = int(entry.get("channel"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if channel <= 0 or channel not in normalized:
             continue
 
         fallback = normalized[channel]
@@ -56,7 +103,32 @@ def normalize_channel_definitions(channels: Iterable[Dict[str, Any]] | None) -> 
             "color": color,
         }
 
-    return [normalized[channel] for channel in VALID_CHANNELS]
+    return [normalized[channel] for channel in sorted(normalized)]
+
+
+def channel_definitions_are_default(
+    channels: Iterable[Dict[str, Any]] | None,
+    channel_ids: Optional[Iterable[int]] = None,
+) -> bool:
+    normalized = normalize_channel_definitions(channels, channel_ids=channel_ids)
+    defaults = default_channel_definitions(entry["channel"] for entry in normalized)
+    return normalized == defaults
+
+
+def detect_channel_definitions_from_dir(input_dir: Path) -> List[Dict[str, object]] | None:
+    try:
+        microscopy_files = find_nd2_files(input_dir, recursive=True)
+    except Exception:
+        return None
+
+    for path in microscopy_files:
+        try:
+            detected = detect_channel_definitions_from_file(str(path))
+        except Exception:
+            continue
+        if detected:
+            return normalize_channel_definitions(detected)
+    return None
 
 
 def normalize_channel_color(value: Any, fallback: str = "#ffffff") -> str:
@@ -76,8 +148,11 @@ def normalize_channel_color(value: Any, fallback: str = "#ffffff") -> str:
     return f"#{hex_value}"
 
 
-def channel_definition_map(channels: Iterable[Dict[str, Any]] | None) -> Dict[int, Dict[str, object]]:
-    return {int(entry["channel"]): dict(entry) for entry in normalize_channel_definitions(channels)}
+def channel_definition_map(
+    channels: Iterable[Dict[str, Any]] | None,
+    channel_ids: Optional[Iterable[int]] = None,
+) -> Dict[int, Dict[str, object]]:
+    return {int(entry["channel"]): dict(entry) for entry in normalize_channel_definitions(channels, channel_ids=channel_ids)}
 
 
 def channel_color_rgb(color: str) -> Tuple[float, float, float]:

@@ -2,6 +2,7 @@ export interface ConfigScanResponse {
   study_name: string;
   input_dir: string;
   nd2_files: string[];
+  channel_definitions?: ChannelDefinition[] | null;
   groups: Array<{
     group_name: string;
     subjects: Array<{
@@ -67,6 +68,8 @@ export interface LoadedStudy {
   nd2_available: boolean;
   ratio_definitions: RatioDefinition[];
   channel_definitions: ChannelDefinition[];
+  channel_limits: Record<string, number>;
+  max_threshold: number;
   pixel_size_um?: number | null;
 }
 
@@ -80,9 +83,7 @@ export interface RatioDefinition {
 export interface MouseAverageRecord {
   Group: string;
   MouseID: string;
-  Channel_1_area: number;
-  Channel_2_area: number;
-  Channel_3_area: number;
+  channel_areas: Record<string, number>;
   ratios?: Record<string, number>;
 }
 
@@ -90,9 +91,7 @@ export interface IndividualImageRecord {
   group: string;
   mouse_id: string;
   filename: string;
-  channel_1_area: number;
-  channel_2_area: number;
-  channel_3_area: number;
+  channel_areas: Record<string, number>;
   ratios: Record<string, number>;
   replicate_index: number;
 }
@@ -137,6 +136,7 @@ export interface PreviewResponse {
 export interface PreviewDownloadResponse {
   image_path: string;
   panel_order: string[];
+  composite_channels: number[];
 }
 
 export interface PreviewClearResponse {

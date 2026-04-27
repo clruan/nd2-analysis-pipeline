@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 
 # Import from existing pipeline (reuse functions)
-from image_processing import get_nd2_files
+from image_processing import ensure_microscopy_reader_dependencies, get_nd2_files
 from data_models import GroupConfig
 from .data_models import ThresholdData, ThresholdResults
 from .generator import analyze_single_image_all_thresholds
@@ -25,7 +25,7 @@ def process_directory_all_thresholds(
     is_3d: bool = True,
     marker: str = None,
     n_jobs: int = 1,  # Start with 1 for stability
-    max_threshold: int = 4095,
+    max_threshold: int = 0,
     save_intermediate: bool = True,
     progress_interval: int = 1,  # Show progress every N files
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -34,7 +34,7 @@ def process_directory_all_thresholds(
     Process all supported microscopy files in a directory with threshold analysis.
     
     Mimics the original pipeline's batch processing approach but generates
-    threshold data for all values 0-4095.
+    threshold data for every threshold value up to the configured or detected maximum.
     
     Args:
         input_dir: Directory containing ND2 files
@@ -43,7 +43,7 @@ def process_directory_all_thresholds(
         is_3d: Whether files contain 3D data
         marker: Filename marker for mouse ID extraction
         n_jobs: Number of parallel jobs (default 1 for stability)
-        max_threshold: Maximum threshold value to compute
+        max_threshold: Maximum threshold value to compute. Use 0 to auto-size from the input images.
         
     Returns:
         ThresholdResults object with all processed data
@@ -66,6 +66,7 @@ def process_directory_all_thresholds(
     nd2_files = get_nd2_files(input_dir)
     if not nd2_files:
         raise ValueError(f"No supported microscopy files found in {input_dir}")
+    ensure_microscopy_reader_dependencies(nd2_files)
 
     print(f"📊 Found {len(nd2_files)} microscopy files")
     logger.info(f"Found {len(nd2_files)} microscopy files")
@@ -213,9 +214,10 @@ def save_intermediate_results(results: List[ThresholdData], filepath: str, study
                 'mouse_id': img_data.mouse_id,
                 'group': img_data.group,
                 'filename': img_data.filename,
-                'channel_1_percentages': img_data.channel_1_percentages.tolist(),
-                'channel_2_percentages': img_data.channel_2_percentages.tolist(),
-                'channel_3_percentages': img_data.channel_3_percentages.tolist()
+                'channel_percentages': {
+                    str(channel): values.tolist()
+                    for channel, values in img_data.channel_percentages.items()
+                }
             }
             data['image_data'].append(img_dict)
         
@@ -236,6 +238,8 @@ def save_threshold_results(results: ThresholdResults, filepath: str) -> None:
             'ratio_definitions': results.ratio_definitions,
             'channel_definitions': results.channel_definitions,
             'pixel_size_um': results.pixel_size_um,
+            'channel_limits': {str(channel): limit for channel, limit in results.channel_limits.items()},
+            'max_threshold': results.max_threshold,
             'image_data': []
         }
         
@@ -244,9 +248,10 @@ def save_threshold_results(results: ThresholdResults, filepath: str) -> None:
                 'mouse_id': img_data.mouse_id,
                 'group': img_data.group,
                 'filename': img_data.filename,
-                'channel_1_percentages': img_data.channel_1_percentages.tolist(),
-                'channel_2_percentages': img_data.channel_2_percentages.tolist(),
-                'channel_3_percentages': img_data.channel_3_percentages.tolist()
+                'channel_percentages': {
+                    str(channel): values.tolist()
+                    for channel, values in img_data.channel_percentages.items()
+                }
             }
             data['image_data'].append(img_dict)
         
@@ -268,14 +273,26 @@ def load_threshold_results(filepath: str) -> ThresholdResults:
         # Reconstruct ThresholdData objects
         image_data = []
         for img_dict in data['image_data']:
-            threshold_data = ThresholdData(
-                mouse_id=img_dict['mouse_id'],
-                group=img_dict['group'],
-                filename=img_dict['filename'],
-                channel_1_percentages=np.array(img_dict['channel_1_percentages']),
-                channel_2_percentages=np.array(img_dict['channel_2_percentages']),
-                channel_3_percentages=np.array(img_dict['channel_3_percentages'])
-            )
+            channel_percentages = img_dict.get("channel_percentages")
+            if channel_percentages:
+                threshold_data = ThresholdData(
+                    mouse_id=img_dict['mouse_id'],
+                    group=img_dict['group'],
+                    filename=img_dict['filename'],
+                    channel_percentages={
+                        int(channel): np.asarray(values, dtype=np.float32)
+                        for channel, values in channel_percentages.items()
+                    },
+                )
+            else:
+                threshold_data = ThresholdData(
+                    mouse_id=img_dict['mouse_id'],
+                    group=img_dict['group'],
+                    filename=img_dict['filename'],
+                    channel_1_percentages=np.array(img_dict['channel_1_percentages'], dtype=np.float32),
+                    channel_2_percentages=np.array(img_dict['channel_2_percentages'], dtype=np.float32),
+                    channel_3_percentages=np.array(img_dict['channel_3_percentages'], dtype=np.float32),
+                )
             image_data.append(threshold_data)
         
         return ThresholdResults(
@@ -330,7 +347,7 @@ def print_batch_summary(results: ThresholdResults) -> None:
     
     print()
     print("✅ Ready for interactive threshold analysis!")
-    print("   - All threshold values (0-4095) pre-computed")
+    print(f"   - Threshold values pre-computed up to {results.max_threshold}")
     print("   - Mouse averages can be calculated for any threshold combination")
     print("   - Data ready for web interface")
     print("="*60)

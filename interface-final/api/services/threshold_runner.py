@@ -15,14 +15,19 @@ import numpy as np
 from fastapi import HTTPException
 
 from data_models import GroupConfig
-from image_processing import ensure_microscopy_reader_dependencies, load_nd2_file
+from image_processing import ensure_microscopy_reader_dependencies, load_microscopy_channels
 from threshold_analysis.data_models import ThresholdResults
 
 from ..logging_utils import log_event
 from ..schemas import RunStatus, ThresholdRunRequest
 from ..state import RunRecord, STATE, utc_now
 from ..utils import ensure_directory, find_nd2_files, normalize_path, preview_plane_filename, slugify
-from .channels import DEFAULT_CHANNEL_DEFINITIONS, normalize_channel_definitions
+from .channels import (
+    DEFAULT_CHANNEL_DEFINITIONS,
+    channel_definitions_are_default,
+    detect_channel_definitions_from_dir,
+    normalize_channel_definitions,
+)
 from .ratios import DEFAULT_RATIO_DEFINITIONS, normalize_ratio_definitions
 from .studies import PREVIEW_ROOT
 
@@ -45,7 +50,12 @@ def launch_threshold_run(payload: ThresholdRunRequest) -> RunStatus:
     try:
         group_config = GroupConfig.from_json(str(config_path))
         ratio_definitions = normalize_ratio_definitions(group_config.ratios)
-        channel_definitions = normalize_channel_definitions(group_config.channel_definitions)
+        raw_channel_definitions = group_config.channel_definitions
+        channel_definitions = normalize_channel_definitions(raw_channel_definitions)
+        if (not raw_channel_definitions or channel_definitions_are_default(raw_channel_definitions)) and input_dir.exists():
+            detected_channels = detect_channel_definitions_from_dir(input_dir)
+            if detected_channels:
+                channel_definitions = detected_channels
         pixel_size_um = group_config.pixel_size_um
     except Exception:
         pixel_size_um = None
@@ -165,11 +175,11 @@ def cache_run_previews(record: RunRecord, results: ThresholdResults) -> Optional
         if source_path is None:
             continue
         try:
-            channel_arrays = load_nd2_file(str(source_path), is_3d=record.is_3d)
+            channel_arrays = load_microscopy_channels(str(source_path), is_3d=record.is_3d)
         except Exception:
             continue
 
-        for channel_index, plane in enumerate(channel_arrays, start=1):
+        for channel_index, plane in sorted(channel_arrays.items()):
             array = np.asarray(plane)
             if array.ndim > 2:
                 array = array.max(axis=0)

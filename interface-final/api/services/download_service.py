@@ -16,10 +16,14 @@ from ..schemas import DownloadResponse
 from ..utils import ensure_directory
 from .analysis_service import _collect_replicate_metrics
 from .channels import channel_definition_map
-from .study_common import DOWNLOAD_ROOT, GRAPH_PAD_EXPORT_KEYS, _get_record, _threshold_dict
+from .study_common import DOWNLOAD_ROOT, _get_record, _record_channel_ids, _threshold_dict
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _graph_pad_export_keys_from_ids(channel_ids: List[int]) -> List[str]:
+    return [f"Channel_{channel}_area" for channel in channel_ids]
 
 
 def _graphpad_group_order(mouse_df: pd.DataFrame) -> List[str]:
@@ -60,6 +64,7 @@ def _build_graphpad_dataframe(
     mouse_df: pd.DataFrame,
     ratio_defs: List[Dict[str, object]],
     channel_defs: List[Dict[str, object]],
+    channel_ids: List[int],
 ) -> pd.DataFrame:
     if mouse_df.empty:
         return pd.DataFrame()
@@ -68,8 +73,8 @@ def _build_graphpad_dataframe(
         return pd.DataFrame()
     blocks: List[pd.DataFrame] = []
     counts: Dict[str, int] = {}
-    channel_map = channel_definition_map(channel_defs)
-    for metric_key in GRAPH_PAD_EXPORT_KEYS:
+    channel_map = channel_definition_map(channel_defs, channel_ids=channel_ids)
+    for metric_key in _graph_pad_export_keys_from_ids(channel_ids):
         channel_index = int(metric_key.split("_")[1])
         label = str(channel_map.get(channel_index, {}).get("label", f"Channel {channel_index}"))
         block, block_counts = _build_graphpad_block(mouse_df, metric_key, label, group_order)
@@ -99,26 +104,26 @@ def _format_replicates_dataframe(
     individual_df: pd.DataFrame,
     ratios: List[Dict[str, object]],
     channel_defs: List[Dict[str, object]],
+    channel_ids: List[int],
 ) -> pd.DataFrame:
     if individual_df.empty:
         return individual_df
 
     table = individual_df.copy()
-    channel_map = channel_definition_map(channel_defs)
-    ch1_label = str(channel_map.get(1, {}).get("label", "Channel 1"))
-    ch2_label = str(channel_map.get(2, {}).get("label", "Channel 2"))
-    ch3_label = str(channel_map.get(3, {}).get("label", "Channel 3"))
+    channel_map = channel_definition_map(channel_defs, channel_ids=channel_ids)
     rename_map = {
         "group": "Group",
         "mouse_id": "Mouse ID",
         "replicate_index": "Replicate #",
         "filename": "Filename",
-        "channel_1_area": f"{ch1_label} Area (%)",
-        "channel_2_area": f"{ch2_label} Area (%)",
-        "channel_3_area": f"{ch3_label} Area (%)",
-        "channel_1_3_ratio": "Channel 1 / Channel 3",
-        "channel_2_3_ratio": "Channel 2 / Channel 3",
     }
+    ordered_channel_columns: List[str] = []
+    for channel in channel_ids:
+        channel_label = str(channel_map.get(channel, {}).get("label", f"Channel {channel}"))
+        source_key = f"channel_{channel}_area"
+        renamed_key = f"{channel_label} Area (%)"
+        rename_map[source_key] = renamed_key
+        ordered_channel_columns.append(renamed_key)
     ratio_labels: List[str] = []
     for ratio in ratios:
         ratio_id = ratio.get("id")
@@ -134,10 +139,8 @@ def _format_replicates_dataframe(
         "Mouse ID",
         "Replicate #",
         "Filename",
-        f"{ch1_label} Area (%)",
-        f"{ch2_label} Area (%)",
-        f"{ch3_label} Area (%)",
     ]
+    ordered_columns.extend(ordered_channel_columns)
     ordered_columns.extend(ratio_labels)
     existing_columns = [column for column in ordered_columns if column in table.columns]
     table = table[existing_columns]
@@ -157,7 +160,8 @@ def _format_replicates_dataframe(
 
 def generate_downloads(study_id: str, thresholds: Dict[str, int]) -> DownloadResponse:
     record = _get_record(study_id)
-    thresholds = _threshold_dict(thresholds)
+    channel_ids = _record_channel_ids(record)
+    thresholds = _threshold_dict(thresholds, channel_ids=channel_ids)
 
     mouse_averages_df = record.results.get_mouse_averages(thresholds)
     from .study_common import _ensure_ratio_columns
@@ -174,8 +178,18 @@ def generate_downloads(study_id: str, thresholds: Dict[str, int]) -> DownloadRes
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     excel_path = download_dir / f"{study_id}_thresholds_{timestamp}.xlsx"
 
-    graphpad_df = _build_graphpad_dataframe(mouse_averages_df, record.ratio_definitions, record.channel_definitions)
-    replicates_df = _format_replicates_dataframe(individual_images, record.ratio_definitions, record.channel_definitions)
+    graphpad_df = _build_graphpad_dataframe(
+        mouse_averages_df,
+        record.ratio_definitions,
+        record.channel_definitions,
+        channel_ids,
+    )
+    replicates_df = _format_replicates_dataframe(
+        individual_images,
+        record.ratio_definitions,
+        record.channel_definitions,
+        channel_ids,
+    )
 
     try:
         _write_excel_workbook(excel_path, graphpad_df, mouse_averages_df, replicates_df)

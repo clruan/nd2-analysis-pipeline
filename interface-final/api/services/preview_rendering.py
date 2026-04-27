@@ -18,7 +18,6 @@ from .channels import (
     channel_definition_map,
     normalize_channel_definitions,
 )
-from .study_common import ALL_PREVIEW_METRICS, DEFAULT_PREVIEW_METRIC
 
 
 MASK_RENDER_VERSION = "binary-bw-v1"
@@ -30,18 +29,14 @@ class PreviewVariant(NamedTuple):
     cacheable: bool
 
 
-def _normalize_metric(metric: Optional[str]) -> str:
-    if metric in ALL_PREVIEW_METRICS:
-        return metric
-    return DEFAULT_PREVIEW_METRIC
-
-
 def _normalize_metrics(
     metrics: Optional[Iterable[str]],
     fallback: Optional[str] = None,
     available: Optional[Iterable[str]] = None,
 ) -> List[str]:
-    allowed = list(available) if available else list(ALL_PREVIEW_METRICS)
+    allowed = list(available or [])
+    if not allowed:
+        return [fallback] if fallback else []
     if metrics:
         ordered: List[str] = []
         for metric in metrics:
@@ -49,9 +44,8 @@ def _normalize_metrics(
                 ordered.append(metric)
         if ordered:
             return ordered
-    if fallback:
-        normalized = _normalize_metric(fallback)
-        return [normalized]
+    if fallback and fallback in allowed:
+        return [fallback]
     return allowed
 
 
@@ -121,16 +115,16 @@ def _normalize_channel_ranges(payload: Optional[Dict[str, object]]) -> Dict[int,
 
 def _normalize_channel_ids(channel_ids: Optional[Iterable[int]] = None) -> Tuple[int, ...]:
     if channel_ids is None:
-        return (1, 2, 3)
-    normalized = sorted({int(channel_id) for channel_id in channel_ids if int(channel_id) in {1, 2, 3}})
-    return tuple(normalized) or (1, 2, 3)
+        return ()
+    normalized = sorted({int(channel_id) for channel_id in channel_ids if int(channel_id) > 0})
+    return tuple(normalized)
 
 
 def _channel_range_token(
     channel_ranges: Dict[int, Tuple[float, float]],
     channel_ids: Optional[Iterable[int]] = None,
 ) -> str:
-    active_channels = _normalize_channel_ids(channel_ids)
+    active_channels = _normalize_channel_ids(channel_ids) or tuple(sorted(channel_ranges))
     parts = []
     for channel_index in active_channels:
         bounds = channel_ranges.get(channel_index)
@@ -148,9 +142,11 @@ def _channel_color_token(
     channel_definitions: List[Dict[str, object]],
     channel_ids: Optional[Iterable[int]] = None,
 ) -> str:
-    active_channels = _normalize_channel_ids(channel_ids)
-    normalized = normalize_channel_definitions(channel_definitions)
-    defaults = normalize_channel_definitions(DEFAULT_CHANNEL_DEFINITIONS)
+    active_channels = _normalize_channel_ids(channel_ids) or tuple(
+        sorted({int(entry["channel"]) for entry in (channel_definitions or []) if int(entry["channel"]) > 0})
+    )
+    normalized = normalize_channel_definitions(channel_definitions, channel_ids=active_channels)
+    defaults = normalize_channel_definitions(DEFAULT_CHANNEL_DEFINITIONS, channel_ids=active_channels)
     normalized_map = {int(entry["channel"]): entry for entry in normalized}
     default_map = {int(entry["channel"]): entry for entry in defaults}
     parts = []
@@ -199,7 +195,7 @@ def _preview_dependency_token(
     channel_definitions: List[Dict[str, object]],
     variant: PreviewVariant,
 ) -> str:
-    active_channels = variant.channels or _normalize_channel_ids()
+    active_channels = variant.channels
     tokens: List[str] = []
     if variant.variant in {"mask", "overlay"}:
         tokens.append(MASK_RENDER_VERSION)
@@ -335,13 +331,15 @@ def _generate_raw_image(
     channels: Dict[int, np.ndarray],
     channel_ranges: Dict[int, Tuple[float, float]],
     channel_definitions: List[Dict[str, object]],
+    channel_ids: Optional[Iterable[int]] = None,
 ) -> Optional[np.ndarray]:
     sample = next((array for array in channels.values() if array is not None), None)
     if sample is None:
         return None
     rgb = np.zeros((*sample.shape, 3), dtype=np.float32)
-    color_map = channel_definition_map(channel_definitions)
-    for channel_id in (1, 2, 3):
+    active_channel_ids = _normalize_channel_ids(channel_ids) or tuple(sorted(channels))
+    color_map = channel_definition_map(channel_definitions, channel_ids=active_channel_ids)
+    for channel_id in active_channel_ids:
         source = channels.get(channel_id)
         if source is None:
             continue
@@ -401,8 +399,10 @@ def _generate_mask_image(
     channels: Dict[int, np.ndarray],
     thresholds: Dict[str, int],
     channel_definitions: List[Dict[str, object]],
+    channel_ids: Optional[Iterable[int]] = None,
 ) -> Optional[np.ndarray]:
-    masks = {channel_id: _build_binary_mask(channels, thresholds, channel_id) for channel_id in (1, 2, 3)}
+    active_channel_ids = _normalize_channel_ids(channel_ids) or tuple(sorted(channels))
+    masks = {channel_id: _build_binary_mask(channels, thresholds, channel_id) for channel_id in active_channel_ids}
     valid_masks = [mask for mask in masks.values() if mask is not None]
     if not valid_masks:
         sample = next(iter(channels.values()), None)
@@ -478,11 +478,13 @@ def _generate_overlay_image(
     thresholds: Dict[str, int],
     channel_ranges: Dict[int, Tuple[float, float]],
     channel_definitions: List[Dict[str, object]],
+    channel_ids: Optional[Iterable[int]] = None,
 ) -> Optional[np.ndarray]:
-    raw = _generate_raw_image(channels, channel_ranges, channel_definitions)
+    active_channel_ids = _normalize_channel_ids(channel_ids) or tuple(sorted(channels))
+    raw = _generate_raw_image(channels, channel_ranges, channel_definitions, channel_ids=active_channel_ids)
     if raw is None:
         return None
-    masks = [_build_binary_mask(channels, thresholds, channel_id) for channel_id in (1, 2, 3)]
+    masks = [_build_binary_mask(channels, thresholds, channel_id) for channel_id in active_channel_ids]
     masks = [mask for mask in masks if mask is not None]
     if not masks:
         return raw
@@ -500,11 +502,11 @@ def _render_preview_variant(
     if variant.variant == "raw":
         if len(variant.channels) == 1:
             return _generate_channel_raw_image(channels, variant.channels[0], channel_ranges, channel_definitions)
-        return _generate_raw_image(channels, channel_ranges, channel_definitions)
+        return _generate_raw_image(channels, channel_ranges, channel_definitions, channel_ids=variant.channels)
     if variant.variant == "mask":
         if len(variant.channels) == 1:
             return _generate_channel_mask_image(channels, thresholds, variant.channels[0], channel_definitions)
-        return _generate_mask_image(channels, thresholds, channel_definitions)
+        return _generate_mask_image(channels, thresholds, channel_definitions, channel_ids=variant.channels)
     if variant.variant == "overlay":
         if len(variant.channels) == 1:
             return _generate_channel_overlay_image(
@@ -522,7 +524,7 @@ def _render_preview_variant(
                 channel_ranges,
                 channel_definitions,
             )
-        return _generate_overlay_image(channels, thresholds, channel_ranges, channel_definitions)
+        return _generate_overlay_image(channels, thresholds, channel_ranges, channel_definitions, channel_ids=variant.channels)
     return None
 
 

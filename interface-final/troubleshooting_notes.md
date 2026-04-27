@@ -69,6 +69,10 @@ This log captures the issues uncovered during the most recent debugging session 
   Attempted to solve long x-axis labels by wrapping charts in a horizontal scroller. Users preferred Plotly’s native zoom/pan so the change was reverted and replaced with scroll-wheel zoom plus pan/zoom buttons.
 - **Subject ID heuristics**  
   `guess_subject_id` returned the first alphanumeric token in a filename (e.g., `A1_A17_rep1` → `A1`), causing downstream grouping errors where `A17` appeared under `A1`. The helper now ranks all matches by digit length and position, picking the most specific token.
+- **Known-ID substring collisions during threshold runs**
+  `parse_mouse_id` previously accepted the first known ID whose normalized text appeared anywhere in the filename, so shorter IDs like `C1` could steal `C11` / `C12`, and zero-padded config IDs could fail against unpadded filenames. The matcher now prefers exact token hits, ranks more specific IDs first, and falls back to zero-padding-aware matching only when needed.
+- **Preview groups disappearing from the wall**
+  The preview pane used only groups present in the preview response images, so a group with zero tiles vanished entirely. The UI now keeps the loaded study group order and renders `No preview` placeholders for missing groups so gaps stay visible while debugging run output.
 - **Config builder drift**  
   Loading an existing config did not refresh the editable JSON/Group Builder view, so manual corrections from earlier sessions were lost. The loader now normalizes the config map, updates the JSON textarea, and rerenders the builder so hand-curated groups stay in sync.
 - **Excel export dependency gaps**  

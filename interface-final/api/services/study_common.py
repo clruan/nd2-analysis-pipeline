@@ -21,29 +21,47 @@ PREVIEW_ROOT = ensure_directory(Path(__file__).resolve().parent / "generated_pre
 
 LOGGER = logging.getLogger(__name__)
 
-CHANNEL_METRICS: Tuple[Dict[str, object], ...] = (
-    {"id": "channel_1_area", "kind": "channel", "channel": 1},
-    {"id": "channel_2_area", "kind": "channel", "channel": 2},
-    {"id": "channel_3_area", "kind": "channel", "channel": 3},
-)
-
-ALL_PREVIEW_METRICS: Tuple[str, ...] = (
-    "channel_1_area",
-    "channel_2_area",
-    "channel_3_area",
-    "channel_1_3_ratio",
-    "channel_2_3_ratio",
-)
-
-DEFAULT_PREVIEW_METRIC = ALL_PREVIEW_METRICS[0]
-DEFAULT_PANEL_ORDER: Tuple[str, ...] = ("channel_1", "channel_2", "channel_3", "composite")
-GRAPH_PAD_EXPORT_KEYS: Tuple[str, ...] = ("Channel_1_area", "Channel_2_area", "Channel_3_area")
-
 SUBJECT_TOKEN_PATTERN = re.compile(r"([A-Za-z]+)(\d{1,4})")
 
 
 def _channel_defs_for_record(record: StudyRecord) -> Dict[int, Dict[str, object]]:
-    return channel_definition_map(record.channel_definitions)
+    return channel_definition_map(record.channel_definitions, channel_ids=_record_channel_ids(record))
+
+
+def _record_channel_ids(record: StudyRecord) -> List[int]:
+    channel_ids = sorted({int(entry["channel"]) for entry in (record.channel_definitions or []) if int(entry["channel"]) > 0})
+    if channel_ids:
+        return channel_ids
+    return list(record.results.channel_ids)
+
+
+def _channel_metric_definitions(record: StudyRecord) -> List[Dict[str, object]]:
+    return [
+        {"id": f"channel_{channel}_area", "kind": "channel", "channel": channel}
+        for channel in _record_channel_ids(record)
+    ]
+
+
+def _preview_metric_ids(record: StudyRecord) -> List[str]:
+    metrics = [metric["id"] for metric in _channel_metric_definitions(record)]
+    metrics.extend(str(ratio["id"]) for ratio in record.ratio_definitions)
+    return metrics
+
+
+def _default_preview_metric(record: StudyRecord) -> str:
+    metrics = _preview_metric_ids(record)
+    return metrics[0] if metrics else "channel_1_area"
+
+
+def _default_panel_order(channel_ids: Iterable[int]) -> List[str]:
+    normalized_ids = sorted({int(channel) for channel in channel_ids if int(channel) > 0})
+    order = [f"channel_{channel}" for channel in normalized_ids]
+    order.append("composite")
+    return order or ["composite"]
+
+
+def _graph_pad_export_keys(record: StudyRecord) -> List[str]:
+    return [f"Channel_{channel}_area" for channel in _record_channel_ids(record)]
 
 
 def _channel_label(record: StudyRecord, channel: int) -> str:
@@ -220,7 +238,7 @@ def _match_subject_from_filename(
 
 def _metric_definitions(record: StudyRecord) -> List[Dict[str, object]]:
     metrics: List[Dict[str, object]] = []
-    for defn in CHANNEL_METRICS:
+    for defn in _channel_metric_definitions(record):
         metric = dict(defn)
         channel = int(metric.get("channel", 1))
         metric["label"] = _channel_area_label(record, channel)
@@ -248,12 +266,24 @@ def _ensure_ratio_columns(mouse_df: pd.DataFrame, ratios: List[Dict[str, object]
             mouse_df[ratio["id"]] = np.nan
 
 
-def _threshold_dict(thresholds: Dict[str, int]) -> Dict[str, int]:
-    return {
-        "channel_1": thresholds.get("channel_1", 0),
-        "channel_2": thresholds.get("channel_2", 0),
-        "channel_3": thresholds.get("channel_3", 0),
-    }
+def _threshold_dict(thresholds: Dict[str, int], channel_ids: Optional[Iterable[int]] = None) -> Dict[str, int]:
+    normalized: Dict[str, int] = {}
+    expected_ids = sorted({int(channel) for channel in (channel_ids or []) if int(channel) > 0})
+    for channel in expected_ids:
+        key = f"channel_{channel}"
+        value = thresholds.get(key, 0)
+        normalized[key] = max(0, int(value))
+
+    for key, value in thresholds.items():
+        match = re.match(r"^channel_(\d+)$", str(key))
+        if not match:
+            continue
+        normalized[f"channel_{int(match.group(1))}"] = max(0, int(value))
+
+    if normalized:
+        return dict(sorted(normalized.items(), key=lambda item: int(item[0].split("_")[1])))
+
+    return {"channel_1": 0, "channel_2": 0, "channel_3": 0}
 
 
 def _get_record(study_id: str) -> StudyRecord:
@@ -264,14 +294,17 @@ def _get_record(study_id: str) -> StudyRecord:
 
 
 def _analysis_cache_key(thresholds: Dict[str, int]) -> str:
-    return f"{thresholds['channel_1']}-{thresholds['channel_2']}-{thresholds['channel_3']}"
+    parts = [f"{key}={thresholds[key]}" for key in sorted(thresholds, key=lambda item: int(item.split("_")[1]))]
+    return "|".join(parts)
 
 
-def _sanitize_panel_order(order: Optional[Iterable[str]]) -> List[str]:
+def _sanitize_panel_order(order: Optional[Iterable[str]], channel_ids: Optional[Iterable[int]] = None) -> List[str]:
+    default_order = _default_panel_order(channel_ids or [1, 2, 3])
+    allowed_panels = set(default_order)
     if not order:
-        return list(DEFAULT_PANEL_ORDER)
+        return default_order
     normalized: List[str] = []
     for panel in order:
-        if panel in DEFAULT_PANEL_ORDER and panel not in normalized:
+        if panel in allowed_panels and panel not in normalized:
             normalized.append(panel)
-    return normalized or list(DEFAULT_PANEL_ORDER)
+    return normalized or default_order

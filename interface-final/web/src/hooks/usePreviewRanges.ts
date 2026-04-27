@@ -3,12 +3,9 @@ import type { ChannelRangePayload } from "../api/hooks";
 import { useAppStore } from "../state/useAppStore";
 import { useDebouncedValue } from "./useDebouncedValue";
 
-type ChannelId = "channel_1" | "channel_2" | "channel_3";
-
-const toPayload = (ranges: Record<ChannelId, [number, number]>): ChannelRangePayload => {
+const toPayload = (ranges: Record<string, [number, number]>): ChannelRangePayload => {
   const payload: ChannelRangePayload = {};
-  (Object.keys(ranges) as ChannelId[]).forEach((channel) => {
-    const [vmin, vmax] = ranges[channel];
+  Object.entries(ranges).forEach(([channel, [vmin, vmax]]) => {
     payload[channel] = { vmin, vmax };
   });
   return payload;
@@ -21,14 +18,10 @@ export function usePreviewRanges(debounceMs = 250) {
   const payload = useMemo(() => toPayload(previewChannelRanges), [previewChannelRanges]);
   const debouncedPayload = useMemo(() => toPayload(debouncedRanges), [debouncedRanges]);
 
-  // Signature helps cache keys detect range changes without passing the full object.
   const debouncedSignature = useMemo(() => {
-    return (Object.keys(debouncedRanges) as ChannelId[])
-      .map((channel) => {
-        const [min, max] = debouncedRanges[channel];
-        return `${channel}:${min}-${max}`;
-      })
-      .sort()
+    return Object.entries(debouncedRanges)
+      .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }))
+      .map(([channel, [min, max]]) => `${channel}:${min}-${max}`)
       .join("|");
   }, [debouncedRanges]);
 

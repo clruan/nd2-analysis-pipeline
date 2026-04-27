@@ -11,12 +11,12 @@ from pydantic import BaseModel, Field
 class RatioDefinition(BaseModel):
     id: Optional[str] = None
     label: Optional[str] = None
-    numerator_channel: int = Field(..., ge=1, le=3)
-    denominator_channel: int = Field(..., ge=1, le=3)
+    numerator_channel: int = Field(..., ge=1)
+    denominator_channel: int = Field(..., ge=1)
 
 
 class ChannelDefinition(BaseModel):
-    channel: int = Field(..., ge=1, le=3)
+    channel: int = Field(..., ge=1)
     label: str = Field(..., min_length=1)
     color: str = Field(..., min_length=1)
 
@@ -50,6 +50,7 @@ class ConfigScanResponse(BaseModel):
     input_dir: str
     nd2_files: List[str]
     groups: List[GroupInfo]
+    channel_definitions: Optional[List[ChannelDefinition]] = None
 
 
 class ConfigCreateRequest(BaseModel):
@@ -100,7 +101,7 @@ class ThresholdRunRequest(BaseModel):
     is_3d: bool = True
     marker: Optional[str] = None
     n_jobs: int = 1
-    max_threshold: int = 4095
+    max_threshold: int = Field(0, ge=0)
     reuse_existing: bool = True
 
 
@@ -136,21 +137,41 @@ class AnalyzeRequest(BaseModel):
 class MouseAverageRecord(BaseModel):
     Group: str
     MouseID: str
-    Channel_1_area: float
-    Channel_2_area: float
-    Channel_3_area: float
+    channel_areas: Dict[str, float] = Field(default_factory=dict)
     ratios: Dict[str, float] = Field(default_factory=dict)
+
+    @property
+    def Channel_1_area(self) -> float:
+        return float(self.channel_areas.get("channel_1_area", 0.0))
+
+    @property
+    def Channel_2_area(self) -> float:
+        return float(self.channel_areas.get("channel_2_area", 0.0))
+
+    @property
+    def Channel_3_area(self) -> float:
+        return float(self.channel_areas.get("channel_3_area", 0.0))
 
 
 class IndividualImageRecord(BaseModel):
     group: str
     mouse_id: str
     filename: str
-    channel_1_area: float
-    channel_2_area: float
-    channel_3_area: float
+    channel_areas: Dict[str, float] = Field(default_factory=dict)
     ratios: Dict[str, float] = Field(default_factory=dict)
     replicate_index: int
+
+    @property
+    def channel_1_area(self) -> float:
+        return float(self.channel_areas.get("channel_1_area", 0.0))
+
+    @property
+    def channel_2_area(self) -> float:
+        return float(self.channel_areas.get("channel_2_area", 0.0))
+
+    @property
+    def channel_3_area(self) -> float:
+        return float(self.channel_areas.get("channel_3_area", 0.0))
 
 
 class AnalyzeResponse(BaseModel):
@@ -231,12 +252,15 @@ class PreviewDownloadRequest(BaseModel):
     thresholds: Dict[str, int]
     channel_ranges: Optional[Dict[str, ChannelRange]] = None
     panel_order: Optional[List[str]] = None
+    composite_channels: Optional[List[int]] = None
     scale_bar_um: Optional[float] = None
+    scale_bar_font_size: Optional[int] = Field(None, ge=6, le=32)
 
 
 class PreviewDownloadResponse(BaseModel):
     image_path: str
     panel_order: List[str]
+    composite_channels: List[int]
 
 
 class PreviewClearRequest(BaseModel):
